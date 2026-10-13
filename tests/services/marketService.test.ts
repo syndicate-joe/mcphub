@@ -37,4 +37,13 @@ describe('recovered marketplace catalog', () => {
     expect(catalog['skill-anthropics-skills'].kind).toBe('skill');
     expect(searchMarketServers('Agent Skill').length).toBeGreaterThanOrEqual(90);
   });
+  it('merges bundled source snapshots with preserved provenance and separate resource kinds', () => {
+    const catalog = getMarketServers();
+    const imported = Object.values(catalog).find((entry) => entry.kind === 'workflow');
+    expect(imported).toBeDefined();
+    expect(imported?.provenance?.revision).toMatch(/^[a-f0-9]{40}$/);
+    expect(imported?.installations).toEqual({});
+    expect(catalog['source-n8n-templates'].kind).toBe('directory');
+    expect(catalog['skill-anthropics-skills'].kind).toBe('skill');
+  });
 });

@@ -1,3 +1,4 @@
+import type { MarketplaceKind, MarketplaceProvenance } from '../utils/marketplace.js';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import {
   Client,
@@ -74,7 +75,9 @@ export interface MarketServerTool {
 }
 
 export interface MarketServer {
-  kind?: 'mcp' | 'skill' | 'directory';
+  kind?: MarketplaceKind;
+  provenance?: MarketplaceProvenance;
+  compatibility?: string;
   name: string;
   display_name: string;
   description: string;

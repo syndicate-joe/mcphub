@@ -1,5 +1,6 @@
 import {
   getMarketplaceKind,
+  marketplaceKinds,
   filterMarketplaceEntries,
   countMarketplaceKinds,
   paginateMarketplaceEntries,
@@ -47,7 +48,37 @@ describe('marketplace sections', () => {
       skill,
     ]);
     expect(filterMarketplaceEntries(entries, 'directory', 'review')).toEqual([directory]);
-    expect(countMarketplaceKinds(entries)).toEqual({ mcp: 1, skill: 2, directory: 1 });
+    expect(countMarketplaceKinds(entries)).toEqual({
+      mcp: 1,
+      skill: 2,
+      directory: 1,
+      agent: 0,
+      workflow: 0,
+      prompt: 0,
+      instruction: 0,
+      hook: 0,
+      plugin: 0,
+    });
+  });
+
+  it('keeps every new resource kind out of the MCP section and scopes source filtering', () => {
+    const entries = marketplaceKinds
+      .filter((kind) => kind !== 'mcp')
+      .map((kind) => ({
+        ...server,
+        kind,
+        name: kind,
+        provenance: { source: 'Example source' },
+        compatibility: 'Copilot',
+      }));
+    expect(filterMarketplaceEntries(entries, 'mcp')).toEqual([]);
+    expect(
+      filterMarketplaceEntries(entries, 'workflow', 'copilot', '', '', 'Example source'),
+    ).toHaveLength(1);
+    expect(filterMarketplaceEntries(entries, 'workflow', '', '', '', 'Other source')).toEqual([]);
+    expect(getMarketplaceKind({ ...server, kind: 'plugin', categories: ['Agent Skills'] })).toBe(
+      'plugin',
+    );
   });
 
   it('filters before pagination and clamps stale pages when changing sections', () => {

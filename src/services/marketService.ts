@@ -19,6 +19,22 @@ export const getMarketServers = (): Record<string, MarketServer> => {
     const serversJsonPath = getServersJsonPath();
     const data = fs.readFileSync(serversJsonPath, 'utf8');
     const serversObj = JSON.parse(data) as Record<string, MarketServer>;
+    const directoriesPath = getConfigFilePath(
+      'catalog/directories.json',
+      'Marketplace directories',
+    );
+    if (fs.existsSync(directoriesPath))
+      Object.assign(serversObj, JSON.parse(fs.readFileSync(directoriesPath, 'utf8')));
+    const importedPath = getConfigFilePath('catalog/imported.json', 'Marketplace sources');
+    if (fs.existsSync(importedPath)) {
+      const imported = JSON.parse(fs.readFileSync(importedPath, 'utf8')) as {
+        schemaVersion: number;
+        entries: Record<string, MarketServer>;
+      };
+      if (imported.schemaVersion !== 1 || !imported.entries)
+        throw new Error('Invalid marketplace sources');
+      Object.assign(serversObj, imported.entries);
+    }
     const overlayPath = getConfigFilePath('catalog/overrides.json', 'Marketplace overlay');
     if (fs.existsSync(overlayPath)) {
       const overlay = JSON.parse(fs.readFileSync(overlayPath, 'utf8')) as {

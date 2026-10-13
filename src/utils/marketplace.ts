@@ -1,4 +1,35 @@
-export type MarketplaceKind = 'mcp' | 'skill' | 'directory';
+export const marketplaceKinds = [
+  'mcp',
+  'skill',
+  'agent',
+  'workflow',
+  'prompt',
+  'instruction',
+  'hook',
+  'plugin',
+  'directory',
+] as const;
+export type MarketplaceKind = (typeof marketplaceKinds)[number];
+export const marketplaceSectionKeys: Record<MarketplaceKind, string> = {
+  mcp: 'servers',
+  skill: 'skills',
+  agent: 'agents',
+  workflow: 'workflows',
+  prompt: 'prompts',
+  instruction: 'instructions',
+  hook: 'hooks',
+  plugin: 'plugins',
+  directory: 'directory',
+};
+export interface MarketplaceProvenance {
+  source: string;
+  repo: string;
+  path: string;
+  revision: string;
+  fetchedAt: string;
+  url: string;
+  metadataWarnings?: string[];
+}
 
 interface MarketplaceEntry {
   kind?: MarketplaceKind;
@@ -7,18 +38,20 @@ interface MarketplaceEntry {
   description: string;
   categories?: string[];
   tags?: string[];
+  provenance?: { source: string };
+  compatibility?: string;
   installations?: Record<string, { command?: string; args?: string[] }>;
 }
 
 export function getMarketplaceKind(entry: MarketplaceEntry): MarketplaceKind {
-  if (entry.kind === 'skill' || entry.categories?.includes('Agent Skills')) return 'skill';
+  if (entry.kind && entry.kind !== 'mcp') return entry.kind;
+  if (entry.categories?.includes('Agent Skills')) return 'skill';
   if (
     Object.values(entry.installations || {}).some(
       (install) => install.args?.[0] === 'skills' && install.args?.[1] === 'add',
     )
   )
     return 'skill';
-  if (entry.kind === 'directory') return 'directory';
   if (entry.kind !== 'mcp' && entry.categories?.includes('Curated Registries')) return 'directory';
   return Object.keys(entry.installations || {}).length ? 'mcp' : 'directory';
 }
@@ -29,16 +62,20 @@ export function filterMarketplaceEntries<T extends MarketplaceEntry>(
   query = '',
   category = '',
   tag = '',
+  source = '',
 ): T[] {
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
   return entries.filter((entry) => {
     if (getMarketplaceKind(entry) !== kind) return false;
+    if (source && (entry.provenance?.source || '__existing__') !== source) return false;
     if (category && !entry.categories?.includes(category)) return false;
     if (tag && !entry.tags?.includes(tag)) return false;
     const text = [
       entry.name,
       entry.display_name,
       entry.description,
+      entry.provenance?.source || '',
+      entry.compatibility || '',
       ...(entry.categories || []),
       ...(entry.tags || []),
     ]
@@ -54,7 +91,10 @@ export function countMarketplaceKinds(entries: MarketplaceEntry[]) {
       counts[getMarketplaceKind(entry)]++;
       return counts;
     },
-    { mcp: 0, skill: 0, directory: 0 },
+    Object.fromEntries(marketplaceKinds.map((kind) => [kind, 0])) as Record<
+      MarketplaceKind,
+      number
+    >,
   );
 }
 

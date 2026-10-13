@@ -2,6 +2,13 @@
 
 MCPHub (`@samanhappy/mcphub`) is a TypeScript/Node.js ESM hub that aggregates MCP servers behind a single HTTP service with a React/Vite dashboard.
 
+## Fork contribution policy
+
+This checkout contributes only to `syndicate-joe/mcphub`. Use that explicit repository
+for GitHub mutations and PR base repositories. Upstream is a read-only reference;
+do not push, open issues or pull requests, or message upstream maintainers. The
+fork owner handles upstream contact personally.
+
 ## Always apply
 
 - Use `pnpm` (`pnpm@10.12.4`, declared in `package.json`).

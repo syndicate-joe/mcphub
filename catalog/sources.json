@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "repo": "anthropics/skills",
+      "format": "skills",
+      "label": "Anthropic Skills",
+      "platform": "Agent Skills"
+    },
+    {
+      "repo": "vercel-labs/agent-skills",
+      "format": "skills",
+      "label": "Vercel Agent Skills",
+      "platform": "Agent Skills",
+      "license": "MIT"
+    },
+    {
+      "repo": "github/awesome-copilot",
+      "format": "copilot",
+      "label": "Awesome Copilot",
+      "platform": "GitHub Copilot",
+      "license": "MIT"
+    },
+    {
+      "repo": "anthropics/claude-plugins-official",
+      "format": "claude-plugins",
+      "label": "Claude Plugins",
+      "platform": "Claude Code"
+    }
+  ]
+}
