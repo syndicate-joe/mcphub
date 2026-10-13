@@ -1,7 +1,7 @@
 /**
  * MCP OAuth Provider Implementation
  *
- * Implements OAuthClientProvider interface from @modelcontextprotocol/sdk/client/auth.js
+ * Implements OAuthClientProvider interface from @modelcontextprotocol/client
  * to handle OAuth 2.0 authentication for upstream MCP servers using the SDK's built-in
  * OAuth support.
  *
@@ -12,13 +12,14 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type {
+  OAuthClientProvider,
+  OAuthDiscoveryState,
   OAuthClientInformation,
   OAuthClientInformationFull,
   OAuthClientMetadata,
   OAuthTokens,
-} from '@modelcontextprotocol/sdk/shared/auth.js';
+} from '@modelcontextprotocol/client';
 import { ServerConfig } from '../types/index.js';
 import { getSystemConfigDao } from '../dao/index.js';
 import {
@@ -62,6 +63,9 @@ type OAuthClientInformationWithAuthMethod = OAuthClientInformation &
 export class MCPHubOAuthProvider implements OAuthClientProvider {
   private serverName: string;
   private serverConfig: ServerConfig;
+  private _discoveryState?: OAuthDiscoveryState;
+  private _issuer?: string;
+  private _issRequired?: boolean;
   private _codeVerifier?: string;
   private _currentState?: string;
   private _systemInstallBaseUrl?: string;
@@ -87,6 +91,20 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
 
   private getSystemInstallBaseUrl(): string | undefined {
     return this._systemInstallBaseUrl;
+  }
+
+  async allowInsecureTokenEndpoint(endpoint: URL): Promise<boolean> {
+    // Re-read the admin-controlled setting so a revoked exception cannot be
+    // reused by an old transport or a pending authorization callback.
+    const config = await loadServerConfig(this.serverName);
+    if (endpoint.protocol !== 'http:' || config?.oauth?.allowInsecureTokenEndpoint !== true) {
+      return false;
+    }
+    logger.warn('Sending OAuth credentials over HTTP with an admin-enabled exception', {
+      serverName: this.serverName,
+      tokenEndpointOrigin: endpoint.origin,
+    });
+    return true;
   }
 
   /**
@@ -120,6 +138,14 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
           ? 'client_secret_post'
           : 'none';
 
+    // `oauth.scopes` is `string[] | undefined`: `undefined` means "not configured/detected",
+    // `[]` means the upstream server explicitly publishes no scopes and should get none. Using
+    // `||` here would treat `''` (from an empty array) the same as "unset" and always fall back
+    // to 'openid', which zero-scope authorization servers commonly reject (see #1227).
+    const configuredScopes = this.serverConfig.oauth?.scopes;
+    const scope =
+      metadata.scope || (configuredScopes !== undefined ? configuredScopes.join(' ') : 'openid');
+
     return {
       ...metadata, // Include any additional custom metadata
       client_name: metadata.client_name || `MCPHub - ${this.serverName}`,
@@ -127,7 +153,7 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       grant_types: metadata.grant_types || ['authorization_code', 'refresh_token'],
       response_types: metadata.response_types || ['code'],
       token_endpoint_auth_method: tokenEndpointAuthMethod,
-      scope: metadata.scope || this.serverConfig.oauth?.scopes?.join(' ') || 'openid',
+      scope,
     };
   }
 
@@ -139,7 +165,10 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       return existingScopes;
     }
 
-    if (existingScopes && existingScopes.length > 0) {
+    // `existingScopes !== undefined` (not `.length > 0`): an empty array is a previously
+    // resolved "this server uses no scopes" result and must short-circuit re-fetching just like
+    // a non-empty one would.
+    if (existingScopes !== undefined) {
       return existingScopes;
     }
 
@@ -148,7 +177,9 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         serverUrl,
         await createOAuthFetch(this.serverConfig),
       );
-      if (scopes && scopes.length > 0) {
+      // `scopes !== undefined`: persist and honor an explicitly empty result too, not only a
+      // non-empty one (see #1227).
+      if (scopes !== undefined) {
         const updatedConfig = await mutateOAuthSettings(this.serverName, ({ oauth }) => {
           oauth.scopes = scopes;
         });
@@ -311,6 +342,9 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
 
     this._codeVerifier = undefined;
     this._currentState = undefined;
+    this._discoveryState = undefined;
+    this._issuer = undefined;
+    this._issRequired = undefined;
 
     const serverInfo = getServerByName(this.serverName);
     if (serverInfo) {
@@ -318,6 +352,31 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
     }
 
     logger.log('Saved OAuth tokens', { serverName: this.serverName });
+  }
+
+  // Capture the SDK's actual discovery result before redirecting. Keep this
+  // snapshot with the pending flow so callback validation survives restarts.
+  saveDiscoveryState(state: OAuthDiscoveryState): void {
+    this._discoveryState = state;
+    const metadata = state.authorizationServerMetadata;
+    this._issuer = metadata?.issuer;
+    this._issRequired = Boolean(
+      metadata &&
+        'authorization_response_iss_parameter_supported' in metadata &&
+        metadata.authorization_response_iss_parameter_supported === true,
+    );
+  }
+
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    if (this._discoveryState) return this._discoveryState;
+
+    const storedConfig = await loadServerConfig(this.serverName);
+    const state = storedConfig?.oauth?.pendingAuthorization?.discoveryState;
+    if (state && storedConfig) {
+      this.serverConfig = storedConfig;
+      this.saveDiscoveryState(state);
+    }
+    return state;
   }
 
   /**
@@ -344,6 +403,9 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
     try {
       const pendingUpdate: Partial<NonNullable<ServerConfig['oauth']>['pendingAuthorization']> = {
         authorizationUrl,
+        discoveryState: this._discoveryState,
+        issuer: this._issuer ?? this.serverConfig.oauth?.dynamicRegistration?.issuer,
+        issRequired: this._issRequired,
         state,
       };
 
@@ -360,14 +422,28 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
         serverName: this.serverName,
         error,
       });
+      throw error;
     }
 
     // Store the authorization URL in ServerInfo for the frontend to access
     const serverInfo = getServerByName(this.serverName);
     if (serverInfo) {
+      // Keep serverInfo.config in sync with the freshly persisted pending
+      // authorization (new state + createdAt). The OAuth callback's TTL check
+      // (isOAuthStateCurrent) reads createdAt from serverInfo.config, not from
+      // this provider's private this.serverConfig. Without this, serverInfo.config
+      // keeps whatever stale pendingAuthorization snapshot was loaded at server
+      // init/last reconnect, so the TTL check compares against an ever-older
+      // timestamp and eventually rejects fresh, well-within-TTL callbacks as
+      // "expired" even though serverInfo.oauth.state matches correctly.
+      if (this.serverConfig) {
+        serverInfo.config = this.serverConfig;
+      }
       serverInfo.status = 'oauth_required';
       serverInfo.oauth = {
         authorizationUrl,
+        issuer: this._issuer ?? this.serverConfig.oauth?.dynamicRegistration?.issuer,
+        issRequired: this._issRequired,
         state,
         // codeVerifier is intentionally NOT stored on serverInfo.oauth: it is a
         // PKCE credential, and storing it on the long-lived ServerInfo taints the
@@ -442,7 +518,14 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
    * Invalidate cached OAuth credentials when the SDK detects they are no longer valid.
    * This keeps stored configuration in sync and forces a fresh authorization flow.
    */
-  async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier'): Promise<void> {
+  async invalidateCredentials(
+    scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery',
+  ): Promise<void> {
+    if (scope === 'discovery' || scope === 'verifier' || scope === 'all') {
+      this._discoveryState = undefined;
+      this._issuer = undefined;
+      this._issRequired = undefined;
+    }
     const storedConfig = await loadServerConfig(this.serverName);
 
     if (!storedConfig?.oauth) {
@@ -489,6 +572,10 @@ export class MCPHubOAuthProvider implements OAuthClientProvider {
       }
     }
 
+    if (scope === 'discovery' && currentConfig.oauth.pendingAuthorization) {
+      assignUpdatedConfig(await clearOAuthData(this.serverName, 'discovery'));
+    }
+
     if (scope === 'verifier' || scope === 'all') {
       this._codeVerifier = undefined;
       this._currentState = undefined;
@@ -514,7 +601,9 @@ const prepopulateScopesIfMissing = async (
   serverName: string,
   serverConfig: ServerConfig,
 ): Promise<void> => {
-  if (!serverConfig.oauth || serverConfig.oauth.scopes?.length) {
+  // `[]` means resolved-to-no-scopes; a missing `oauth` block means never resolved, so
+  // discovery must still run before the first registration too (#1227).
+  if (serverConfig.oauth?.scopes !== undefined) {
     return;
   }
 
@@ -523,16 +612,22 @@ const prepopulateScopesIfMissing = async (
   }
 
   try {
-    const scopes = await fetchScopesFromServer(serverConfig.url);
-    if (scopes && scopes.length > 0) {
-      const updatedConfig = await mutateOAuthSettings(serverName, ({ oauth }) => {
-        oauth.scopes = scopes;
-      });
-
+    const scopes = await fetchScopesFromServer(
+      serverConfig.url,
+      await createOAuthFetch(serverConfig),
+    );
+    // `scopes !== undefined`: persist and honor an explicitly empty result too (see #1227).
+    if (scopes !== undefined) {
+      // Update the in-memory config first: if the DAO write below throws, this connection
+      // attempt still proceeds with the correct scopes instead of falling back to 'openid'.
       if (!serverConfig.oauth) {
         serverConfig.oauth = {};
       }
       serverConfig.oauth.scopes = scopes;
+
+      const updatedConfig = await mutateOAuthSettings(serverName, ({ oauth }) => {
+        oauth.scopes = scopes;
+      });
 
       if (updatedConfig) {
         logger.log('Stored auto-detected OAuth scopes during provider initialization', {
@@ -591,7 +686,7 @@ export const createOAuthProvider = async (
     return undefined;
   }
 
-  // Ensure scopes are pre-populated if dynamic registration already ran previously
+  // Discover and persist scopes before the first registration attempt, not only on later ones.
   await prepopulateScopesIfMissing(serverName, serverConfig);
 
   // Initialize OAuth for the server (performs registration if needed)

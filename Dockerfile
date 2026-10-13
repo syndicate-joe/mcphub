@@ -43,7 +43,8 @@ RUN uv tool install mcp-server-fetch
 
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml .pnpmfile.cjs ./
+COPY patches ./patches
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
   pnpm config set store-dir /pnpm/store && pnpm fetch --frozen-lockfile
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
@@ -51,8 +52,9 @@ RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
 
 COPY . .
 
-# Download the latest servers.json from mcpm.sh and replace the existing file
-RUN curl -s -f --connect-timeout 10 https://mcpm.sh/api/servers.json -o servers.json || echo "Failed to download servers.json, using bundled version"
+# Refresh MCPM atomically, retaining the fork's overlay even when offline.
+RUN node scripts/sync-skills-and-registries.mjs --mcpm --output servers.json \
+  || node scripts/sync-skills-and-registries.mjs --output servers.json
 
 RUN pnpm build
 # Keep the legacy path available only for user-mounted configuration.

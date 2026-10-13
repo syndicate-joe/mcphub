@@ -2,6 +2,55 @@ import type { ServerFormData } from '../../frontend/src/types';
 import { buildServerPayload } from '../../frontend/src/utils/serverFormPayload';
 
 describe('buildServerPayload', () => {
+  it('preserves args credential targets and placeholders when editing stdio servers', () => {
+    const credentialTemplate: ServerFormData['credentialTemplate'] = [
+      { target: 'env', name: 'ENV_KEY' },
+      { target: 'args', name: 'API_KEY' },
+    ];
+    const payload = buildServerPayload({
+      formData: {
+        name: 'cli',
+        url: '',
+        command: 'node',
+        arguments: '',
+        args: ['--key={{args.API_KEY}}'],
+        env: [],
+        headers: [],
+        credentialTemplate,
+      },
+      serverType: 'stdio',
+      envVars: [],
+      headerVars: [],
+    });
+    expect(payload.config.credentialTemplate).toEqual(credentialTemplate);
+    expect(payload.config.args).toEqual(['--key={{args.API_KEY}}']);
+  });
+  it('preserves stdio argument boundaries, empty values, and literal shell syntax', () => {
+    const args = [
+      '-c',
+      'exec cli --api-key "$my_api_key"',
+      '/path with spaces',
+      '',
+      '  padded  ',
+      'a"b\\c',
+    ];
+    const payload = buildServerPayload({
+      formData: {
+        name: 'wrapped',
+        url: '',
+        command: 'sh',
+        arguments: '',
+        args,
+        env: [],
+        headers: [],
+      },
+      serverType: 'stdio',
+      envVars: [],
+      headerVars: [],
+    });
+    expect(payload.config.args).toEqual(args);
+  });
+
   it('keeps empty headers and env payloads explicit for SSE servers', () => {
     const payload = buildServerPayload({
       formData: {
@@ -380,4 +429,48 @@ describe('buildServerPayload', () => {
     expect(payload.config.oauth).not.toHaveProperty('redirectUri');
     expect(Object.keys(payload.config.oauth ?? {})).toEqual(['clientId', 'scopes']);
   });
+});
+
+describe('stdio buffer form payload', () => {
+  const payload = (maxBufferSize?: number) =>
+    buildServerPayload({
+      formData: {
+        name: 'big',
+        command: 'node',
+        url: '',
+        arguments: '',
+        args: [],
+        env: [],
+        headers: [],
+        options: { maxBufferSize },
+      },
+      serverType: 'stdio',
+      envVars: [],
+      headerVars: [],
+    });
+  it('preserves an explicit limit and omits an unset limit', () => {
+    expect(payload(268435456).config.options).toEqual({ maxBufferSize: 268435456 });
+    expect(payload().config.options).toEqual({});
+  });
+  it.each([0, -1, 1.5, NaN, Infinity])('rejects invalid limits %s', (size) => {
+    expect(() => payload(size)).toThrow('positive safe integer');
+  });
+});
+
+it.each([undefined, false, true])('round-trips HTTP OAuth exception=%s from the form', (value) => {
+  const payload = buildServerPayload({
+    formData: {
+      name: 'gitlab',
+      url: 'http://gitlab.example/mcp',
+      command: '',
+      arguments: '',
+      env: [],
+      headers: [],
+      oauth: { allowInsecureTokenEndpoint: value },
+    },
+    serverType: 'streamable-http',
+    envVars: [],
+    headerVars: [],
+  });
+  expect(payload.config.oauth?.allowInsecureTokenEndpoint).toBe(value);
 });

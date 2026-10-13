@@ -6,9 +6,11 @@ import { getSettingsPath } from '../config/index.js';
 import { getCredentialBindingDao } from '../dao/DaoFactory.js';
 import { RequestContextService } from './requestContextService.js';
 import { getT } from '../utils/i18n.js';
+import { logger } from '../utils/logger.js';
 import type { ServerConfig, StoredCredentialBinding } from '../types/index.js';
 import {
   CredentialBindingError,
+  argumentCredentialBindings,
   credentialSlotId,
   validateCredentialTemplate,
 } from '../utils/credentialTemplate.js';
@@ -198,6 +200,48 @@ export const deleteCredentialBindings = async (filter: {
   credentialBindingEvents.emit('invalidate', filter);
 };
 
+// Copies every binding of a server being renamed to the new name. The server
+// name is part of the ciphertext's associated data, so each binding is
+// re-encrypted rather than moved. The originals stay until the caller deletes
+// them after the rename has succeeded. All bindings are decrypted before the
+// first write: if one cannot be (missing, unreadable or wrong key, damaged
+// row), nothing is written and the rename fails, so a recoverable binding is
+// never discarded. A failed save removes the copies already written.
+export const copyCredentialBindings = async (oldName: string, newName: string): Promise<void> => {
+  const dao = getCredentialBindingDao();
+  const copies: StoredCredentialBinding[] = [];
+  for (const username of await dao.listUsernames(oldName)) {
+    const binding = await dao.get(oldName, username);
+    if (!binding) continue;
+    let values: Record<string, string>;
+    try {
+      values = await decrypt(binding);
+    } catch (error) {
+      throw new CredentialBindingError(
+        `Cannot rename '${oldName}': the credential binding of user '${username}' cannot be decrypted (${error instanceof Error ? error.message : String(error)}). Restore the encryption key, or have the user replace or delete that binding, then rename again`,
+      );
+    }
+    copies.push({
+      ...binding,
+      serverName: newName,
+      encryptedValues: await encrypt(newName, username, values),
+    });
+  }
+  try {
+    for (const copy of copies) await dao.save(copy);
+  } catch (error) {
+    await deleteCredentialBindings({ serverName: newName }).catch((cleanupError) =>
+      logger.error('Failed to remove partial credential binding copies after a failed rename', {
+        serverName: oldName,
+        newName,
+        error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      }),
+    );
+    throw error;
+  }
+  credentialBindingEvents.emit('invalidate', { serverName: newName });
+};
+
 export const resolveCredentialBinding = async (
   serverName: string,
   username: string,
@@ -212,9 +256,14 @@ export const resolveCredentialBinding = async (
     env: { ...config.env },
     headers: { ...config.headers },
   };
+  const argumentValues: Record<string, string> = Object.create(null);
   for (const slot of slots) {
     const value = values[credentialSlotId(slot)];
     if (typeof value !== 'string' || !value.length) throw missingCredentialError(serverName);
+    if (slot.target === 'args') {
+      argumentValues[slot.name] = value;
+      continue;
+    }
     if (slot.target === 'headers') {
       for (const name of Object.keys(resolved.headers!)) {
         if (name.toLowerCase() === slot.name.toLowerCase()) delete resolved.headers![name];
@@ -222,6 +271,7 @@ export const resolveCredentialBinding = async (
     }
     resolved[slot.target]![slot.name] = value;
   }
+  argumentCredentialBindings.set(resolved, argumentValues);
   // Caller-supplied passthrough headers must never override a bound slot.
   const boundHeaders = new Set(
     slots.filter((slot) => slot.target === 'headers').map((slot) => slot.name.toLowerCase()),

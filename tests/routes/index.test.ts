@@ -221,14 +221,32 @@ jest.mock('../../src/middlewares/auth.js', () => ({
   auth: authMiddleware,
 }));
 
+const mockGetBetterAuthRuntimeConfig = jest.fn(() => ({
+  enabled: false,
+  basePath: '/better-auth',
+}));
+const mockSetMountedSsoProviders = jest.fn();
+
 jest.mock('../../src/services/betterAuthConfig.js', () => ({
-  getBetterAuthRuntimeConfig: () => ({ enabled: false, basePath: '/better-auth' }),
+  getBetterAuthRuntimeConfig: mockGetBetterAuthRuntimeConfig,
+  setMountedSsoProviders: mockSetMountedSsoProviders,
+}));
+
+jest.mock('../../src/betterAuth.js', () => ({
+  auth: {},
+  ensureBetterAuthSchema: jest.fn(async () => undefined),
+  registeredSsoProviders: ['oidc'],
+}));
+
+jest.mock('better-auth/node', () => ({
+  toNodeHandler: jest.fn(() => jest.fn()),
 }));
 
 import {
   authenticatedRouteRateLimiter,
   hostedInternalEventRateLimiter,
 } from '../../src/utils/rateLimit.js';
+import { requireAdminMiddleware } from '../../src/utils/requireAdmin.js';
 import { initRoutes } from '../../src/routes/index.js';
 
 type ExpressLayer = {
@@ -308,6 +326,31 @@ describe('initRoutes authenticated API rate limiting', () => {
     expect(routerContainsRoute(protectedRouter!, 'delete', '/oauth/clients/:clientId')).toBe(true);
   });
 
+  it('gates MCPB upload behind the admin middleware before multer stages the body', async () => {
+    const app = express();
+
+    await initRoutes(app);
+
+    const apiRouter = findMountedRouter(app);
+    const protectedRouter = apiRouter.stack?.find(
+      (layer) => layer.name === 'router' && layer.handle?.stack,
+    )?.handle;
+
+    const uploadRoute = protectedRouter?.stack?.find(
+      (layer) => layer.route?.path === '/mcpb/upload',
+    );
+    const handles = uploadRoute?.route?.stack?.map((layer) => layer.handle) ?? [];
+
+    // requireAdminMiddleware must run first (rejecting non-admins with 403
+    // before `uploadMiddleware`/multer writes the request body to disk), with
+    // the handler last. This is the pre-body authorization gate for
+    // GHSA-xf2m-3c3x-53vp.
+    expect(handles[0]).toBe(requireAdminMiddleware);
+    expect(handles[1]).toBe(uploadMiddleware);
+    expect(handles[2]).toBe(routeHandler);
+    expect(handles).toHaveLength(3);
+  });
+
   it('matches public auth routes before the shared authenticated rate limiter', async () => {
     const app = express();
 
@@ -379,5 +422,24 @@ describe('initRoutes authenticated API rate limiting', () => {
     expect(findAppRoute(app, 'get', '/api/openapi.yaml')).toBeDefined();
     expect(findAppRoute(app, 'get', '/api/:name/openapi.json')).toBeDefined();
     expect(findAppRoute(app, 'get', '/api/:name/openapi.yaml')).toBeDefined();
+  });
+
+  it('records the Better Auth providers as mounted once their handler is mounted', async () => {
+    mockGetBetterAuthRuntimeConfig.mockReturnValueOnce({
+      enabled: true,
+      basePath: '/api/auth/better',
+    });
+    // initRoutes never mounts Better Auth under a test runner
+    const { JEST_WORKER_ID, NODE_ENV } = process.env;
+    delete process.env.JEST_WORKER_ID;
+    process.env.NODE_ENV = 'production';
+    try {
+      await initRoutes(express());
+    } finally {
+      process.env.JEST_WORKER_ID = JEST_WORKER_ID;
+      process.env.NODE_ENV = NODE_ENV;
+    }
+
+    expect(mockSetMountedSsoProviders).toHaveBeenCalledWith(['oidc']);
   });
 });

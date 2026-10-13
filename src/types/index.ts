@@ -1,8 +1,11 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import {
+  Client,
+  SSEClientTransport,
+  StreamableHTTPClientTransport,
+  RequestOptions,
+  type OAuthDiscoveryState,
+} from '@modelcontextprotocol/client';
 import { SmartRoutingConfig } from '../utils/smartRouting.js';
 
 // User interface
@@ -32,6 +35,7 @@ export interface IGroupServerConfig {
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
+  pinnedTools?: string[]; // Tool names listed next to the meta-tools on $smart/<group> (must also be selected in tools)
 }
 
 // Market server types
@@ -70,6 +74,7 @@ export interface MarketServerTool {
 }
 
 export interface MarketServer {
+  kind?: 'mcp' | 'skill';
   name: string;
   display_name: string;
   description: string;
@@ -212,11 +217,30 @@ export interface BetterAuthConfig {
   basePath?: string; // Base path to mount Better Auth handler
   trustedOrigins?: string[]; // Explicitly trusted origins for social/OIDC login requests
   disableAutoCreate?: boolean; // When true, SSO login will not auto-create new users
+  disablePasswordLogin?: boolean; // When true and an SSO provider is enabled, username/password login is refused
   providers?: {
     google?: BetterAuthProviderToggle;
     github?: BetterAuthProviderToggle;
     oidc?: BetterAuthOidcProviderConfig;
   };
+}
+
+export type ForwardAuthMode = 'jwks';
+
+export interface ForwardAuthJwksConfig {
+  uri?: string; // JWKS endpoint of the upstream identity provider (https required)
+  issuer?: string; // Expected `iss` claim; tokens with this issuer are verified and never fall back
+  audience?: string | string[]; // Accepted `aud` claim value(s)
+  algorithms?: string[]; // Allowed asymmetric algorithms (default: RS256, ES256)
+}
+
+export interface ForwardAuthConfig {
+  enabled?: boolean; // Enable/disable trusting identity from an upstream gateway (default: false)
+  mode?: ForwardAuthMode; // Verification mode; only 'jwks' is supported
+  jwks?: ForwardAuthJwksConfig;
+  usernameClaim?: string; // Claim used for the local username of new users (default: preferred_username)
+  emailClaim?: string; // Claim used for the email of new users (default: email)
+  autoCreate?: boolean; // Create a local non-admin user on first sight of an identity (default: true)
 }
 
 export type ToolResultCompressionStrategy = 'auto' | 'json' | 'log' | 'search' | 'diff' | 'text';
@@ -229,6 +253,9 @@ export interface ToolResultCompressionConfig {
 }
 
 export interface SystemConfig {
+  network?: {
+    allowedCidrs?: string[]; // Admin-managed ranges reachable by non-admin-owned upstreams.
+  };
   routing?: {
     enableGlobalRoute?: boolean; // Controls whether the /sse endpoint without group is enabled
     enableGroupNameRoute?: boolean; // Controls whether group routing by name is allowed
@@ -257,6 +284,7 @@ export interface SystemConfig {
   enableSessionRebuild?: boolean; // Controls whether server session rebuild is enabled
   auth?: {
     betterAuth?: BetterAuthConfig; // Better Auth integration configuration
+    forwardAuth?: ForwardAuthConfig; // Trust identity asserted by an upstream gateway (JWKS-verified JWT)
   };
   discovery?: {
     // Public unauthenticated read-only discovery API for the local market catalog.
@@ -400,7 +428,7 @@ export interface ProxychainsConfig {
 export type ServerVisibility = 'private' | 'group' | 'public';
 
 export interface CredentialSlot {
-  target: 'env' | 'headers';
+  target: 'env' | 'headers' | 'args';
   name: string;
   label?: string;
 }
@@ -437,7 +465,10 @@ export interface ServerConfig {
   tools?: Record<string, { enabled: boolean; description?: string }>; // Tool-specific configurations with enable/disable state and custom descriptions
   prompts?: Record<string, { enabled: boolean; description?: string }>; // Prompt-specific configurations with enable/disable state and custom descriptions
   resources?: Record<string, { enabled: boolean; description?: string }>; // Resource-specific configurations with enable/disable state and custom descriptions
-  options?: Partial<Pick<RequestOptions, 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout'>> & {
+  options?: Partial<
+    Pick<RequestOptions, 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout'>
+  > & {
+    maxBufferSize?: number; // Stdio read buffer limit in bytes; omitted uses the SDK default (10 MiB).
     // Internal persistence carriers for startOnDemand/idleTimeoutMs (see below). The
     // database-backed ServerDao has no dedicated columns for those two fields, so
     // serverConfigPersistence.ts piggybacks them onto this schema-less JSON blob
@@ -451,6 +482,8 @@ export interface ServerConfig {
   proxy?: ProxychainsConfig;
   // OAuth authentication for upstream MCP servers
   oauth?: {
+    // Admin-only, default false: permit HTTP token exchange/refresh for this upstream.
+    allowInsecureTokenEndpoint?: boolean;
     // Static client configuration (traditional OAuth flow)
     clientId?: string; // OAuth client ID
     clientSecret?: string; // OAuth client secret
@@ -496,12 +529,15 @@ export interface ServerConfig {
     // Pending OAuth session metadata for PKCE/state recovery between restarts
     pendingAuthorization?: {
       authorizationUrl?: string;
+      issuer?: string;
+      issRequired?: boolean;
       state?: string;
       codeVerifier?: string;
+      discoveryState?: OAuthDiscoveryState;
       createdAt?: number;
     };
   };
-  perSessionClient?: boolean; // When true, creates a dedicated upstream client per downstream session (session isolation for stateful servers like Playwright)
+  perSessionClient?: boolean; // Dedicated upstream client per legacy session or explicit modern client state
   // On-demand spawning: start the stdio process only when a tool call arrives,
   // and shut it down automatically after a period of inactivity.
   // This reduces persistent memory usage for rarely-used servers.
@@ -522,7 +558,7 @@ export interface ServerConfig {
     // `security`.
     specSecurity?: OpenAPISecurityConfig;
     passthroughHeaders?: string[]; // Header names to pass through from tool call requests to upstream OpenAPI endpoints
-    cookieSession?: boolean; // Opt-in: capture upstream Set-Cookie and replay on later calls, isolated per downstream MCP session
+    cookieSession?: boolean; // Capture/replay cookies per legacy session or explicit modern client state
   };
 }
 
@@ -596,6 +632,8 @@ export interface ServerInfo {
   lastUsedAt?: number; // Timestamp of last tool call (ms since epoch)
   oauth?: {
     // OAuth authorization state
+    issuer?: string;
+    issRequired?: boolean;
     authorizationUrl?: string; // OAuth authorization URL for user to visit
     state?: string; // OAuth state parameter for CSRF protection
     connected?: boolean; // True when stored upstream OAuth tokens exist

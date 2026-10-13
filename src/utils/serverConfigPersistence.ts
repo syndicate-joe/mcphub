@@ -1,4 +1,6 @@
 import { validateCredentialTemplate } from './credentialTemplate.js';
+import { validateMaxBufferSize } from './stdioOptions.js';
+import { ServerConfigValidationError } from './serverConfigValidation.js';
 import { ServerConfig } from '../types/index.js';
 
 const trimToUndefined = (value?: string): string | undefined => {
@@ -34,6 +36,18 @@ const normalizeStringArray = (value?: string[]): string[] | undefined => {
 const normalizeSharedUsers = (value?: string[]): string[] | undefined => {
   const normalized = normalizeStringArray(value);
   return normalized ? Array.from(new Set(normalized)) : undefined;
+};
+
+// Unlike normalizeStringArray, this preserves an explicitly empty array instead of collapsing
+// it to `undefined`. For oauth.scopes, `[]` is a meaningful, distinct value from "not
+// configured" (it says the upstream server uses no OAuth scopes at all) and downstream OAuth
+// registration/authorization logic relies on being able to tell the two apart (see #1227) —
+// collapsing `[]` to `undefined` here silently discarded that signal on every save.
+const normalizeOAuthScopes = (value?: string[]): string[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.map((item) => item.trim()).filter((item) => item.length > 0);
 };
 
 /**
@@ -106,6 +120,8 @@ const normalizeOptions = (
   const normalized: NonNullable<ServerConfig['options']> = {};
 
   if (options) {
+    const maxBufferSize = validateMaxBufferSize(options.maxBufferSize);
+    if (maxBufferSize !== undefined) normalized.maxBufferSize = maxBufferSize;
     if (typeof options.timeout === 'number' && !Number.isNaN(options.timeout)) {
       normalized.timeout = options.timeout;
     }
@@ -140,12 +156,19 @@ const normalizeOptions = (
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 };
 
-const normalizeOAuth = (oauth?: ServerConfig['oauth']): ServerConfig['oauth'] | undefined => {
+export const normalizeOAuth = (oauth?: ServerConfig['oauth']): ServerConfig['oauth'] | undefined => {
   if (!oauth) {
     return undefined;
   }
 
   const normalized: NonNullable<ServerConfig['oauth']> = {};
+
+  if (oauth.allowInsecureTokenEndpoint !== undefined) {
+    if (typeof oauth.allowInsecureTokenEndpoint !== 'boolean') {
+      throw new ServerConfigValidationError('oauth.allowInsecureTokenEndpoint must be a boolean');
+    }
+    normalized.allowInsecureTokenEndpoint = oauth.allowInsecureTokenEndpoint;
+  }
 
   const clientId = trimToUndefined(oauth.clientId);
   const clientSecret = trimToUndefined(oauth.clientSecret);
@@ -156,11 +179,11 @@ const normalizeOAuth = (oauth?: ServerConfig['oauth']): ServerConfig['oauth'] | 
   const resource = trimToUndefined(oauth.resource);
   const redirectUri = trimToUndefined(oauth.redirectUri);
   const revocationEndpoint = trimToUndefined(oauth.revocationEndpoint);
-  const scopes = normalizeStringArray(oauth.scopes);
+  const scopes = normalizeOAuthScopes(oauth.scopes);
 
   if (clientId) normalized.clientId = clientId;
   if (clientSecret) normalized.clientSecret = clientSecret;
-  if (scopes) normalized.scopes = scopes;
+  if (scopes !== undefined) normalized.scopes = scopes;
   if (accessToken) normalized.accessToken = accessToken;
   if (refreshToken) normalized.refreshToken = refreshToken;
   if (authorizationEndpoint) normalized.authorizationEndpoint = authorizationEndpoint;

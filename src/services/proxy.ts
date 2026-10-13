@@ -6,8 +6,7 @@
  * fetch implementation that uses Node.js http/https agents with proxy support.
  *
  */
-
-import { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { FetchLike } from '@modelcontextprotocol/server';
 
 /**
  * Configuration options for HTTP/HTTPS proxy settings.
@@ -72,6 +71,10 @@ export function createFetchWithProxy(
       fetchInput = url;
     }
 
+    // A caller enforcing connection-time DNS validation supplies its dispatcher.
+    // Do not replace it with a proxy that resolves the target independently.
+    if (init && 'dispatcher' in init) return baseFetch(fetchInput, init);
+
     // Check if host should bypass proxy
     if (shouldBypassProxy(targetUrl.hostname, noProxyList)) {
       return baseFetch(fetchInput, init);
@@ -103,6 +106,7 @@ export function createFetchWithProxy(
         'Proxy support requires the "undici" package. ' +
           'Install it with: npm install undici\n' +
           `Original error: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }) as FetchLike;

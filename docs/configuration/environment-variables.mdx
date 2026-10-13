@@ -55,6 +55,7 @@ Provider client credentials remain environment-variable only.
 | `BETTER_AUTH_URL` | Public base URL used to build Better Auth redirect URIs. Takes precedence over `systemConfig.auth.betterAuth.baseUrl` (configurable in Settings → Better Auth) and `systemConfig.install.baseUrl`. Its origin is also auto-added to the trusted origin list. |
 | `BETTER_AUTH_BASE_PATH` | Mount path for the Better Auth handler. Defaults to `/api/auth/better`. |
 | `BETTER_AUTH_TRUSTED_ORIGINS` | Optional additional origins allowed to start Better Auth login flows. Accepts a comma-separated list, whitespace-separated list, or JSON array. When omitted, MCPHub still auto-trusts the origins from `BETTER_AUTH_URL` and `systemConfig.install.baseUrl`. |
+| `BETTER_AUTH_DISABLE_PASSWORD_LOGIN` | Turn off username/password login (`POST /api/auth/login` and the login form) while at least one SSO provider is enabled (and was enabled at startup). Overrides the stored `disablePasswordLogin` setting in both directions, so `false` is also the recovery switch when the identity provider is unavailable. Defaults to `false`. |
 | `BETTER_AUTH_GOOGLE_ENABLED` | Enable or disable the Google provider after credentials are present. Defaults to `true`. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth app credentials. |
 | `BETTER_AUTH_GITHUB_ENABLED` | Enable or disable the GitHub provider after credentials are present. Defaults to `true`. |
@@ -86,6 +87,22 @@ OIDC_CLIENT_ID=your-oidc-client-id
 OIDC_CLIENT_SECRET=your-oidc-client-secret
 ```
 
+### Forward auth
+
+Forward auth trusts a JWT issued to users by an upstream gateway and verifies it against the identity provider's JWKS. See [Authentication → Forward auth](/features/authentication#forward-auth-jwks-verified-gateway-identity) for the behavior. Values resolve in this order: `FORWARD_AUTH_*` environment variables, then `systemConfig.auth.forwardAuth`, then built-in defaults. Settings are read per request, so no restart is needed.
+
+| Variable | Description |
+| --- | --- |
+| `FORWARD_AUTH_ENABLED` | Enable forward auth. Defaults to `false`. |
+| `FORWARD_AUTH_MODE` | Verification mode. Only `jwks` is supported. |
+| `FORWARD_AUTH_JWKS_URI` | JWKS endpoint of the identity provider. Must be `https` (plain `http` only for `localhost`). Required. |
+| `FORWARD_AUTH_ISSUER` | Expected `iss` claim. Required. |
+| `FORWARD_AUTH_AUDIENCE` | Accepted `aud` value(s). Accepts a comma-separated list or JSON array; values may contain spaces (for example `My API`). Required. |
+| `FORWARD_AUTH_ALGORITHMS` | Allowed asymmetric algorithms. Defaults to `RS256,ES256`. `HS*` and `none` are never accepted. |
+| `FORWARD_AUTH_USERNAME_CLAIM` | Claim used for the username of newly created users. Defaults to `preferred_username`. |
+| `FORWARD_AUTH_EMAIL_CLAIM` | Claim used for the email of newly created users. Defaults to `email`. |
+| `FORWARD_AUTH_AUTO_CREATE` | Create a non-admin local user for a new identity. Defaults to `true`. |
+
 ## Storage
 
 MCPHub picks file or database storage at boot:
@@ -98,8 +115,7 @@ useDatabase = (USE_DB === 'true') OR (USE_DB unset AND DB_URL is set)
 | --- | --- | --- |
 | `USE_DB` | unset | Force database mode (`true`) or file mode (`false`). |
 | `DB_URL` | unset | PostgreSQL connection URL. Required for database mode. |
-| `USE_DAO_LAYER` | unset | Force the DAO layer on even in file mode (advanced; usually unnecessary). |
-| `DB_POOL_SIZE` | `10` | Maximum TypeORM connection pool size (also applied to the Better Auth pool). |
+| `DB_POOL_SIZE` | `10` | Maximum connections **per pool**. Applied independently to the TypeORM pool and to the Better Auth pool, so it is not a process-wide cap — see the note below. |
 | `DB_POOL_IDLE_TIMEOUT` | `30000` | Idle pool connection timeout (ms). |
 | `DB_CONNECTION_TIMEOUT` | `60000` | Initial connect timeout (ms). |
 | `DB_CONNECTION_RETRY_DELAY` | `3000` | Base delay between automatic reconnection attempts (ms). |
@@ -110,6 +126,12 @@ useDatabase = (USE_DB === 'true') OR (USE_DB unset AND DB_URL is set)
 | `DB_ENABLE_HEALTH_CHECK` | `true` | Run periodic DB health probes (consumed by `/health`). |
 | `DB_HEALTH_CHECK_INTERVAL` | `30000` | Health-probe interval (ms). |
 | `DB_HEALTH_CHECK_QUERY_TIMEOUT` | `5000` | Timeout (ms) for the `SELECT 1` health probe. |
+
+<Note>
+  **`DB_POOL_SIZE` is a per-pool limit.** MCPHub opens one pool for TypeORM and, when Better Auth is enabled, a second one for Better Auth, each sized to `DB_POOL_SIZE`. When both are in use, budget roughly **2 × `DB_POOL_SIZE`** PostgreSQL connections per replica (for example `DB_POOL_SIZE=20` → about 40), plus headroom for other clients and ops tooling against the same database.
+
+  This is the combined *configured* pool capacity, not a strict process-wide cap. During an automatic reconnection, the old pool is torn down with `DB_DESTROY_TIMEOUT`; if that teardown times out, connections from the old pool may linger briefly while the new pool is already open.
+</Note>
 
 See [Database Configuration](/configuration/database-configuration) for end-to-end setup.
 
@@ -129,6 +151,11 @@ Smart Routing performs vector search over upstream tools to surface only the few
 | `EMBEDDING_DIMENSIONS` | unset | Optional output dimensionality for providers that support it. When unset, the provider's model default is used. |
 | `EMBEDDING_DIMENSIONS_API_PASSTHROUGH` | `false` | When `true`, always forward `embeddingDimensions` to the provider as the `dimensions` request parameter. By default MCPHub only forwards `dimensions` for models known to support Matryoshka (MRL) representations (`text-embedding-3-*`, `gemini-embedding-*`); many open models/backends (Qwen3-Embedding, BGE, vLLM/sglang) reject the parameter outright (issue #1131). Enable only for other MRL-capable models. |
 | `EMBEDDING_MAX_TOKENS` | per-model | Override token truncation limit before embedding. Useful to match a local inference server's batch size. |
+| `SMART_ROUTING_EMBEDDING_QUERY_PREFIX` | empty | Text prepended to `search_tools` queries before embedding, for asymmetric retrieval models trained with task prefixes (e.g. `task: search result \| query: ` for EmbeddingGemma). Used verbatim, including the trailing space. |
+| `SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX` | empty | Text prepended to tool and server documents before embedding (e.g. `title: none \| text: ` for EmbeddingGemma). Changing it re-embeds every server. |
+| `SMART_ROUTING_SIMILARITY_THRESHOLD` | unset | Minimum query-to-tool similarity (0-1) for a `search_tools` hit. Unset keeps the query-length heuristic (0.2 / 0.3 / 0.4). |
+| `SMART_ROUTING_FULL_SCHEMA_TOP_N` | unset | Only the first N `search_tools` hits carry their full definition; the rest carry name, description and score, and `describe_tool` is listed to fetch them. Unset returns every hit in full. Ignored with Progressive Disclosure. |
+| `SMART_ROUTING_TOOL_DEFINITION_FIELDS` | `title,annotations` | Comma-separated optional tool fields that full `search_tools` hits and `describe_tool` carry next to name, description and `inputSchema`: `title`, `annotations`, `outputSchema`, `execution`, `icons`, `_meta`. `none` sends none of them. |
 
 ### OpenAI
 
@@ -192,14 +219,11 @@ EMBEDDING_MODEL=text-embedding-3-small
 
 ## Loading order
 
-MCPHub loads variables in this order; later sources override earlier ones:
+At startup MCPHub reads one file, `.env` in the working directory. `.env.local` and `.env.{NODE_ENV}` (e.g. `.env.production`) are not read.
 
-1. System environment variables.
-2. `.env.local` (gitignored).
-3. `.env.{NODE_ENV}` (e.g. `.env.production`).
-4. `.env`.
+A variable already set in the process environment (your shell, Docker `-e` / `env_file`, a Kubernetes manifest) takes precedence; `.env` never overrides it.
 
-`dotenv-expand` is enabled, so `${VAR}` interpolation works inside `.env*` files.
+Values in `.env` are used as written: `${VAR}` references inside `.env` are not expanded. `${VAR}` expansion is available in `mcp_settings.json` instead; see [MCP Settings](/configuration/mcp-settings).
 
 ## Security best practices
 

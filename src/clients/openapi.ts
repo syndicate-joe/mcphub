@@ -11,7 +11,12 @@ import {
   OpenAPISecurityConfig,
   OpenAPIDeclaredSecurity,
 } from '../types/index.js';
-import { assertSafeUrl, UnsafeUrlError, createRedirectValidatingFetch } from '../utils/ssrf.js';
+import {
+  assertSafeUrl,
+  UnsafeUrlError,
+  createRedirectValidatingFetch,
+  ssrfConnectionOptions,
+} from '../utils/ssrf.js';
 import { getUserDao } from '../dao/index.js';
 import { sanitizeStringForLogging, createSafeJSON } from '../utils/serialization.js';
 import {
@@ -65,6 +70,22 @@ function encodePathParameterValue(value: unknown): string {
       .join(',');
   }
   return encodeURIComponent(String(value));
+}
+
+// Path Item parameters apply to every operation under that path; an operation
+// parameter with the same name and location overrides the path-level one.
+function mergeOperationParameters(
+  pathLevel: OpenAPIV3.PathItemObject['parameters'],
+  operationLevel: OpenAPIV3.OperationObject['parameters'],
+): OpenAPIV3.ParameterObject[] | undefined {
+  if (!pathLevel?.length) {
+    return operationLevel as OpenAPIV3.ParameterObject[] | undefined;
+  }
+  const merged = new Map<string, OpenAPIV3.ParameterObject>();
+  for (const param of [...pathLevel, ...(operationLevel ?? [])] as OpenAPIV3.ParameterObject[]) {
+    merged.set(`${param.in}:${param.name}`, param);
+  }
+  return [...merged.values()];
 }
 
 function isPrintableAscii(value: string): boolean {
@@ -363,6 +384,7 @@ export class OpenAPIClient {
     });
 
     const response = await this.httpClient.request({
+      ...ssrfConnectionOptions(this.allowInternalNetworks),
       method: 'post',
       url: safeTokenUrl,
       baseURL: undefined,
@@ -448,6 +470,7 @@ export class OpenAPIClient {
           allowInternal: this.allowInternalNetworks,
         });
         const requestConfig: AxiosRequestConfig = {
+          ...ssrfConnectionOptions(this.allowInternalNetworks),
           responseType: 'text',
           transformResponse: [(data: unknown) => data],
         };
@@ -503,6 +526,7 @@ export class OpenAPIClient {
       const errorMessage = error instanceof Error ? error.message : String(error);
       throw new Error(
         `Failed to load OpenAPI specification: ${sanitizeStringForLogging(errorMessage)}`,
+        { cause: error },
       );
     }
   }
@@ -655,8 +679,12 @@ export class OpenAPIClient {
       ] as const;
 
       for (const method of methods) {
-        const operation = pathItem[method] as OpenAPIV3.OperationObject | undefined;
-        if (!operation) continue;
+        const declaredOperation = pathItem[method] as OpenAPIV3.OperationObject | undefined;
+        if (!declaredOperation) continue;
+        const operation: OpenAPIV3.OperationObject = {
+          ...declaredOperation,
+          parameters: mergeOperationParameters(pathItem.parameters, declaredOperation.parameters),
+        };
 
         // Generate operation name: use operationId first, otherwise generate unique name
         let operationName: string;
@@ -1037,6 +1065,7 @@ export class OpenAPIClient {
       }
       authorizationUsedForRequest = this.getDefaultAuthorizationHeader();
       attemptedUpstreamRequest = true;
+      Object.assign(requestConfig, ssrfConnectionOptions(this.allowInternalNetworks));
       const response = await this.httpClient.request(requestConfig);
 
       if (cookieSessionEnabled && resolvedTarget) {
@@ -1092,6 +1121,7 @@ export class OpenAPIClient {
         responseDetails = sanitizeStringForLogging(responseDetails);
         throw new Error(
           `API call failed: ${status} ${statusText}${responseDetails ? ` ${responseDetails}` : ''}`,
+          { cause: error },
         );
       }
       throw error;

@@ -37,6 +37,7 @@ export interface MarketServerTool {
 }
 
 export interface MarketServer {
+  kind?: 'mcp' | 'skill';
   name: string;
   display_name: string;
   description: string;
@@ -193,7 +194,7 @@ export interface ProxychainsConfig {
 }
 
 export interface CredentialSlot {
-  target: 'env' | 'headers';
+  target: 'env' | 'headers' | 'args';
   name: string;
   label?: string;
 }
@@ -235,11 +236,13 @@ export interface ServerConfig {
     timeout?: number; // Request timeout in milliseconds
     resetTimeoutOnProgress?: boolean; // Reset timeout on progress notifications
     maxTotalTimeout?: number; // Maximum total timeout in milliseconds
+    maxBufferSize?: number; // Stdio read buffer limit in bytes
   }; // MCP request options configuration
   // Proxychains4 proxy configuration for STDIO servers (Linux/macOS only, Windows not supported)
   proxy?: ProxychainsConfig;
   // OAuth authentication for upstream MCP servers
   oauth?: {
+    allowInsecureTokenEndpoint?: boolean; // Admin-only HTTP token endpoint exception
     clientId?: string; // OAuth client ID
     clientSecret?: string; // OAuth client secret
     redirectUri?: string; // Preferred redirect URI for authorization requests and registration
@@ -357,6 +360,7 @@ export interface IGroupServerConfig {
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
+  pinnedTools?: string[]; // Tool names listed next to the meta-tools on $smart/<group> (must also be selected in tools)
 }
 
 export interface Group {
@@ -395,6 +399,7 @@ export interface ServerFormData {
     timeout?: number;
     resetTimeoutOnProgress?: boolean;
     maxTotalTimeout?: number;
+    maxBufferSize?: number;
   };
   // Proxychains4 proxy configuration for STDIO servers (Linux/macOS only).
   // Round-tripped from the stored config so an edit does not drop it.
@@ -411,6 +416,7 @@ export interface ServerFormData {
   idleTimeoutMs?: number;
   oauth?: {
     clientId?: string;
+    allowInsecureTokenEndpoint?: boolean;
     clientSecret?: string;
     scopes?: string;
     accessToken?: string;
@@ -789,6 +795,7 @@ export interface TemplateServerConfig {
   proxy?: ProxychainsConfig;
   oauth?: {
     clientId?: string;
+    allowInsecureTokenEndpoint?: boolean;
     clientSecret?: string;
     scopes?: string[];
     accessToken?: string;

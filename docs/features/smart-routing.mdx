@@ -226,8 +226,7 @@ The same order applies to the `Enabled` toggle and `DB URL`, but the dashboard r
     DB_URL=postgresql://user:pass@host:5432/db?sslmode=require
 
     # Connection pool settings
-    DATABASE_POOL_SIZE=20
-    DATABASE_TIMEOUT=30000
+    DB_POOL_SIZE=20
     ```
 
   </Accordion>
@@ -437,6 +436,31 @@ Smart Routing now supports group-scoped searches, allowing you to limit tool dis
   </Accordion>
 </AccordionGroup>
 
+### Pinned Tools
+
+A `$smart/{group}` endpoint lists only the meta-tools, so even a tool the model calls in nearly every session costs a `search_tools` round trip first. Pin such tools on the group's server entry and the endpoint lists their full definitions next to the meta-tools:
+
+```json
+{
+  "name": "production",
+  "servers": [{ "name": "time", "tools": "all", "pinnedTools": ["get_current_time"] }]
+}
+```
+
+In the dashboard, edit the group, expand the server and click the pin icon next to a selected tool. The icon is shown only while Smart Routing is enabled.
+
+- Pins use the bare tool name, like the `tools` selection. A pin only takes effect for a tool the group selects and that is enabled; other pins are ignored.
+- A pinned tool is listed exactly as on the direct `/mcp/{group}` endpoint — under the server's exposed name, with its description override — and is called directly by that name. It stays in the search index and keeps working through `search_tools`, `describe_tool` and `call_tool`.
+- The global `$smart` endpoint has no group and never lists pinned tools. A group without pins lists exactly the meta-tools, as before.
+- A pinned tool whose listed name equals a meta-tool name (`search_tools`, `describe_tool`, `call_tool`, e.g. alias `describe` + separator `_` + tool `tool`) is not listed, in any mode: calls to those names always go to the meta-tool.
+- The Smart Routing footprint shown for a group includes the definition cost of its pinned tools.
+- Deselecting a tool, in the dashboard or through `PUT /api/groups/:id/server-configs/:serverName/tools`, also removes its pin.
+- On `$smart/{group}`, a pinned tool keeps its MCP Apps metadata (`_meta.ui`) for a client that declares MCP Apps support, so its widget renders, and the server's `ui://` resources and app-only helper tools are reachable from that widget. A client without MCP Apps support gets the metadata stripped, as before. Only pinned tools carry a widget: a tool reached through `search_tools` and `call_tool` has no descriptor of its own for the host to attach a widget to, so pin the tools whose widgets you want. The global `$smart` endpoint is never an MCP Apps route.
+
+<Warning>
+Behind `call_tool`, every tool shares a single client-side approval decision. A pinned tool is listed under its own name, so a client that approves tools one by one applies its per-tool rules to it — review that before pinning a tool that writes.
+</Warning>
+
 ### Progressive Disclosure Mode
 
 Progressive Disclosure is an optimization feature that reduces token usage when working with Smart Routing. When enabled, the tool discovery workflow changes from a 2-step to a 3-step process.
@@ -478,6 +502,65 @@ Progressive Disclosure is an optimization feature that reduces token usage when 
     ```
 
     Use `names` (default) to keep the legacy compact list.
+
+    The list names the servers `search_tools` actually searches: enabled servers that are
+    connected or start on demand. An on-demand server stays listed while it is not connected,
+    whether it shut down after idle or failed to start, since `call_tool` starts it; any other
+    server that failed to connect is left out until it reconnects. Upstream instructions only
+    arrive on connect, so in `full` mode a server that has not connected yet shows its
+    configured description, or just its name.
+  </Accordion>
+
+  <Accordion title="Embedding Task Prefixes">
+    Asymmetric retrieval models are trained with different task prefixes for queries and
+    documents, and score noticeably worse on raw text. Set the prefixes your model expects
+    in Settings → Smart Routing or via environment variables:
+
+    ```bash
+    # EmbeddingGemma
+    SMART_ROUTING_EMBEDDING_QUERY_PREFIX="task: search result | query: "
+    SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX="title: none | text: "
+    ```
+
+    Both are empty by default, which embeds raw text as before. Prefixes are used verbatim,
+    so keep the trailing space. Changing the document prefix re-embeds every server's tools;
+    changing the query prefix takes effect on the next search.
+
+    Prefixes shift the similarity scores (for EmbeddingGemma, weak matches drop more than
+    strong ones), so a threshold tuned on raw text may need recalibrating after you enable them (see
+    **Search Results** below; each hit reports its `score`). A prefix also counts toward the
+    embedding token limit (`EMBEDDING_MAX_TOKENS` or the model default): it is kept and the
+    tool text is truncated that many tokens earlier.
+  </Accordion>
+
+  <Accordion title="Search Results: Scores, Threshold and Schema Budget">
+    Every `search_tools` hit carries a `score`: the cosine similarity between the query and
+    the tool (0-1, two decimals), the same value the threshold is compared with. Results are
+    ordered by relevance, which also weighs how well the tool's server matches the query.
+
+    ```bash
+    # Minimum similarity for a hit (0-1). Unset: by query length —
+    # 0.2 for short queries, 0.4 for long or "specific"/"exact" ones, 0.3 otherwise.
+    SMART_ROUTING_SIMILARITY_THRESHOLD=0.45
+
+    # Only the first N hits carry their full definition (inputSchema etc.); the rest
+    # carry name, description and score, and describe_tool is listed to fetch them.
+    # Unset: every hit is returned in full. Ignored with Progressive Disclosure.
+    SMART_ROUTING_FULL_SCHEMA_TOP_N=3
+
+    # Optional tool fields a full hit (and describe_tool) carries next to name,
+    # description and inputSchema: title, annotations, outputSchema, execution,
+    # icons, _meta. "none" sends none of them. Default: title,annotations.
+    SMART_ROUTING_TOOL_DEFINITION_FIELDS=title,annotations
+    ```
+
+    All three can also be set in Settings → Smart Routing → Search Results, and none of
+    them re-embeds anything. The fields left out by default are meant for clients rather
+    than models and can be large: an upstream server may ship base64 `icons` or a long
+    `outputSchema` with every tool, and in a search result they would only cost tokens.
+    The `inputSchema` is always sent, with its `$schema` key removed. When no tool clears the threshold, the response says so, names the
+    threshold and lists the servers that were searched, so the model can tell the user the
+    capability is not available instead of calling the nearest unrelated tool.
   </Accordion>
 
   <Accordion title="Standard Mode (Default)">
@@ -491,6 +574,8 @@ Progressive Disclosure is an optimization feature that reduces token usage when 
     | `call_tool` | Execute a tool with the provided arguments |
     
     This mode is simpler but uses more tokens due to full schemas in search results.
+    `SMART_ROUTING_FULL_SCHEMA_TOP_N` caps that cost: only the top N hits carry a schema,
+    and `describe_tool` is listed for the rest.
   </Accordion>
 
   <Accordion title="Progressive Disclosure Mode">
@@ -528,7 +613,8 @@ Progressive Disclosure is an optimization feature that reduces token usage when 
               "encoding": { "type": "string", "default": "utf-8" }
             },
             "required": ["path"]
-          }
+          },
+          "score": 0.71
         }
       ]
     }
@@ -540,7 +626,8 @@ Progressive Disclosure is an optimization feature that reduces token usage when 
       "tools": [
         {
           "name": "read_file",
-          "description": "Read contents of a file"
+          "description": "Read contents of a file",
+          "score": 0.71
         }
       ],
       "metadata": {
@@ -917,7 +1004,8 @@ curl -X POST http://localhost:3000/api/smart-routing/feedback \
     - Missing expected tools
 
     **Solutions:**
-    1. Adjust similarity threshold
+    1. Adjust the similarity threshold (`SMART_ROUTING_SIMILARITY_THRESHOLD`), using the
+       `score` of each hit to pick a value
     2. Re-index tools with better descriptions
     3. Use more specific queries
     4. Check tool metadata quality

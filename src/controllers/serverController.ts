@@ -1,4 +1,9 @@
-import { deleteCredentialBindings } from '../services/credentialBindingService.js';
+import { validateAllowedCidrs } from '../utils/ssrf.js';
+import {
+  copyCredentialBindings,
+  deleteCredentialBindings,
+} from '../services/credentialBindingService.js';
+import { StdioOptionsError } from '../utils/stdioOptions.js';
 import { CredentialBindingError } from '../utils/credentialTemplate.js';
 import { isDeepStrictEqual } from 'node:util';
 import { Request, Response } from 'express';
@@ -35,6 +40,7 @@ import {
   syncAllServerToolsEmbeddings,
 } from '../services/vectorSearchService.js';
 import { createSafeJSON } from '../utils/serialization.js';
+import { getNameSeparator } from '../config/index.js';
 import { cloneDefaultOAuthServerConfig } from '../constants/oauthServerDefaults.js';
 import {
   getBearerKeyDao,
@@ -56,11 +62,21 @@ import {
 import { disconnectUpstreamOAuth } from '../services/upstreamOAuthDisconnectService.js';
 import type { UpstreamOAuthDisconnectScope } from '../services/upstreamOAuthDisconnectService.js';
 import { normalizeServerConfigForPersistence } from '../utils/serverConfigPersistence.js';
-import { isPrivilegedServerConfig } from '../utils/serverConfigValidation.js';
+import {
+  isPrivilegedServerConfig,
+  ServerConfigValidationError,
+} from '../utils/serverConfigValidation.js';
 import { validateServerName } from '../utils/serverNameValidation.js';
 import { setCachedSystemConfig } from '../utils/systemConfigCache.js';
 import { DEFAULT_INSTALL_BASE_URL, withResolvedInstallBaseUrl } from '../utils/installBaseUrl.js';
-import { getSmartRoutingConfig, parseBooleanEnvVar } from '../utils/smartRouting.js';
+import {
+  getSmartRoutingConfig,
+  parseBooleanEnvVar,
+  parseFullSchemaTopN,
+  parseSimilarityThreshold,
+  parseToolDefinitionFields,
+} from '../utils/smartRouting.js';
+import { TOOL_DEFINITION_FIELDS } from '../constants/smartRoutingDefaults.js';
 import { previewOpenApiToolStats } from '../services/openApiToolStatsService.js';
 import { logger } from '../utils/logger.js';
 
@@ -128,7 +144,10 @@ const ensureNonAdminCanManageConfig = (
   if (isPrivilegedServerConfig(config)) {
     res.status(403).json({
       success: false,
-      message: 'Only admins can create or modify stdio-based servers',
+      message:
+        config.oauth?.allowInsecureTokenEndpoint === true
+          ? 'Only admins can create or modify servers allowing HTTP OAuth token endpoints'
+          : 'Only admins can create or modify stdio-based servers',
     });
     return false;
   }
@@ -224,7 +243,9 @@ const toConnectionRelevantConfig = (
   const normalized = normalizeServerConfigForPersistence(config) as Record<string, unknown>;
   const picked: Record<string, unknown> = {};
   for (const field of CONNECTION_RELEVANT_CONFIG_FIELDS) {
-    picked[field] = normalized[field];
+    // Database mode reads unset columns (e.g. `proxy`) back as null, while a
+    // request leaves them out; both mean "not set".
+    picked[field] = normalized[field] ?? undefined;
   }
   const comparable = stripUndefinedDeep(picked) as Record<string, unknown>;
   // Treat the default request timeout (60000, the dashboard form default) as
@@ -679,10 +700,23 @@ export const createServer = async (req: Request, res: Response): Promise<void> =
       });
     }
   } catch (error) {
-    res.status(error instanceof CredentialBindingError ? 400 : 500).json({
-      success: false,
-      message: error instanceof CredentialBindingError ? error.message : 'Internal server error',
-    });
+    res
+      .status(
+        error instanceof CredentialBindingError ||
+          error instanceof StdioOptionsError ||
+          error instanceof ServerConfigValidationError
+          ? 400
+          : 500,
+      )
+      .json({
+        success: false,
+        message:
+          error instanceof CredentialBindingError ||
+          error instanceof StdioOptionsError ||
+          error instanceof ServerConfigValidationError
+            ? error.message
+            : 'Internal server error',
+      });
   }
 };
 
@@ -797,7 +831,17 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
       const { name, config } = server;
 
       // Validate server configuration
-      const validation = validateServerConfig(name, config);
+      let validation: ReturnType<typeof validateServerConfig>;
+      try {
+        validation = validateServerConfig(name, config);
+      } catch (error) {
+        if (
+          !(error instanceof StdioOptionsError) &&
+          !(error instanceof ServerConfigValidationError)
+        )
+          throw error;
+        validation = { valid: false, message: error.message };
+      }
       if (!validation.valid) {
         results.push({
           name: name || 'unknown',
@@ -825,7 +869,10 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
           results.push({
             name: serverName,
             success: false,
-            message: 'Only admins can create or modify stdio-based servers',
+            message:
+              normalizedConfig.oauth?.allowInsecureTokenEndpoint === true
+                ? 'Only admins can create or modify servers allowing HTTP OAuth token endpoints'
+                : 'Only admins can create or modify stdio-based servers',
           });
           failureCount++;
           continue;
@@ -938,6 +985,69 @@ export const deleteServer = async (req: Request, res: Response): Promise<void> =
   }
 };
 
+/**
+ * Move the keys of a server's `tools` or `prompts` map from the old name's
+ * prefix to the new one. The dashboard stores toggles and description
+ * overrides under the prefixed item name (`<server><separator><item>`), so
+ * after a rename the old keys match nothing: a tool disabled under them comes
+ * back enabled and callable, and its description override is lost. Keys
+ * without the old prefix are left as they are; if both prefixes are present,
+ * the old one wins, since it is the one that was in effect.
+ *
+ * With the default `-` separator a key such as `notes-delete_note` can also be
+ * the bare name of an upstream tool called `notes-delete_note`, which tool
+ * toggles accept as well. `keepOldKey` says which old-prefix keys to keep next
+ * to their moved copy, so that meaning survives the rename too.
+ */
+const movePrefixedItemKeys = <T>(
+  entries: Record<string, T> | undefined,
+  oldName: string,
+  newName: string,
+  keepOldKey: (key: string) => boolean = () => false,
+): Record<string, T> | undefined => {
+  if (!entries) {
+    return entries;
+  }
+
+  const separator = getNameSeparator();
+  const oldPrefix = `${oldName}${separator}`;
+  const newPrefix = `${newName}${separator}`;
+  const moved = Object.fromEntries(
+    Object.entries(entries).filter(([key]) => !key.startsWith(oldPrefix)),
+  ) as Record<string, T>;
+  for (const [key, value] of Object.entries(entries)) {
+    if (key.startsWith(oldPrefix)) {
+      moved[`${newPrefix}${key.substring(oldPrefix.length)}`] = value;
+      if (keepOldKey(key)) {
+        moved[key] = value;
+      }
+    }
+  }
+  return moved;
+};
+
+/**
+ * Whether an old-prefix `tools` key may be a bare upstream tool name. Tool
+ * toggles accept the bare name as well as the prefixed one, so `notes-x` on
+ * server `notes` applies both to tool `x` and to a tool literally named
+ * `notes-x`. The cached tool list says which bare names exist; without one
+ * (server not connected yet) every such key is kept, which is harmless when
+ * no such tool exists.
+ */
+const bareToolNameCheck = (serverName: string): ((key: string) => boolean) => {
+  const prefix = `${serverName}${getNameSeparator()}`;
+  const cachedTools = getServerByName(serverName)?.tools ?? [];
+  if (cachedTools.length === 0) {
+    return () => true;
+  }
+  const bareNames = new Set(
+    cachedTools.map((tool) =>
+      tool.name.startsWith(prefix) ? tool.name.substring(prefix.length) : tool.name,
+    ),
+  );
+  return (key) => bareNames.has(key);
+};
+
 export const updateServer = async (req: Request, res: Response): Promise<void> => {
   try {
     const { name } = req.params;
@@ -1034,7 +1144,11 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    if (!ensureNonAdminCanManageConfig(req, res, normalizedConfig)) {
+    if (
+      (existingServer.oauth?.allowInsecureTokenEndpoint === true &&
+        !ensureNonAdminCanManageConfig(req, res, existingServer)) ||
+      !ensureNonAdminCanManageConfig(req, res, normalizedConfig)
+    ) {
       return;
     }
 
@@ -1079,9 +1193,29 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
         return;
       }
 
+      // Read the cached tool list before the runtime under the old name is closed
+      const isBareToolName = bareToolNameCheck(name);
+
+      // Personal credential bindings follow a plain rename. A rename that also
+      // changes the connection (target, headers, credential slots, ...) drops
+      // them, so users bind again against the new definition. They are copied
+      // before the definition moves, so a binding that cannot be copied fails
+      // the request with the server, its references and every binding unchanged.
+      const keepBindings = !hasConnectionRelevantChange(existingServer, normalizedConfig);
+      if (keepBindings) {
+        await copyCredentialBindings(name, targetName);
+      }
+
       // Rename the server
-      const renamed = await serverDao.rename(name, targetName);
+      let renamed: boolean;
+      try {
+        renamed = await serverDao.rename(name, targetName);
+      } catch (error) {
+        if (keepBindings) await deleteCredentialBindings({ serverName: targetName });
+        throw error;
+      }
       if (!renamed) {
+        if (keepBindings) await deleteCredentialBindings({ serverName: targetName });
         res.status(404).json({
           success: false,
           message: 'Server not found',
@@ -1095,6 +1229,8 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       // rebuilds serverInfos. Without this explicit close the old stdio child
       // process tree is orphaned and leaks until the process restarts.
       closeServer(name);
+
+      // Kept bindings now have their copies under the new name.
       await deleteCredentialBindings({ serverName: name });
 
       // Update references in groups
@@ -1105,9 +1241,34 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       const bearerKeyDao = getBearerKeyDao();
       await bearerKeyDao.updateServerName(name, targetName);
 
+      // Move tool and prompt toggles to the new prefix. A request without the
+      // map would keep the stored one through the update merge, old keys and
+      // all, so the stored map is moved in that case. Prompt lookups use the
+      // prefixed name only, so prompt keys are always moved.
+      const tools = movePrefixedItemKeys(
+        normalizedConfig.tools ?? existingServer.tools,
+        name,
+        targetName,
+        isBareToolName,
+      );
+      if (tools) {
+        normalizedConfig.tools = tools;
+      }
+      const prompts = movePrefixedItemKeys(
+        normalizedConfig.prompts ?? existingServer.prompts,
+        name,
+        targetName,
+      );
+      if (prompts) {
+        normalizedConfig.prompts = prompts;
+      }
+
       // Drop embeddings stored under the old name so search_tools does not
       // advertise phantom tools; addOrUpdateServer below regenerates them
-      // under the new name. A failure here must not abort the rename.
+      // under the new name. A credential server never connects globally, so
+      // its rows come back on the first per-user connect under the new name
+      // (with a moved binding, or after a user binds again), or on a reindex.
+      // A failure here must not abort the rename.
       try {
         await removeServerToolEmbeddings(name);
       } catch (error) {
@@ -1175,10 +1336,23 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
       });
     }
   } catch (error) {
-    res.status(error instanceof CredentialBindingError ? 400 : 500).json({
-      success: false,
-      message: error instanceof CredentialBindingError ? error.message : 'Internal server error',
-    });
+    res
+      .status(
+        error instanceof CredentialBindingError ||
+          error instanceof StdioOptionsError ||
+          error instanceof ServerConfigValidationError
+          ? 400
+          : 500,
+      )
+      .json({
+        success: false,
+        message:
+          error instanceof CredentialBindingError ||
+          error instanceof StdioOptionsError ||
+          error instanceof ServerConfigValidationError
+            ? error.message
+            : 'Internal server error',
+      });
   }
 };
 
@@ -1676,7 +1850,18 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       oauthServer,
       auth,
       activityLog,
+      network,
     } = req.body;
+    const hasNetworkUpdate = network !== undefined;
+    if (hasNetworkUpdate && (!network || !validateAllowedCidrs(network.allowedCidrs))) {
+      res
+        .status(400)
+        .json({
+          success: false,
+          message: 'network.allowedCidrs must be an array of valid IPv4 or IPv6 CIDRs',
+        });
+      return;
+    }
     const { smartRouting } = migrateLegacySmartRoutingConfig(requestSmartRouting);
 
     const hasRoutingUpdate =
@@ -1716,8 +1901,13 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         typeof smartRouting.progressiveDisclosure === 'boolean' ||
         typeof smartRouting.azureOpenaiEmbeddingModel === 'string' ||
         typeof smartRouting.serverDescriptionMode === 'string' ||
+        typeof smartRouting.embeddingQueryPrefix === 'string' ||
+        typeof smartRouting.embeddingDocumentPrefix === 'string' ||
         typeof smartRouting.embeddingMaxTokens === 'number' ||
-        smartRouting.embeddingMaxTokens === null);
+        smartRouting.embeddingMaxTokens === null ||
+        smartRouting.similarityThreshold !== undefined ||
+        smartRouting.fullSchemaTopN !== undefined ||
+        smartRouting.toolDefinitionFields !== undefined);
 
     const hasToolResultCompressionUpdate =
       toolResultCompression &&
@@ -1760,6 +1950,7 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         typeof auth.betterAuth.baseUrl === 'string' ||
         typeof auth.betterAuth.basePath === 'string' ||
         Array.isArray(auth.betterAuth.trustedOrigins) ||
+        typeof auth.betterAuth.disablePasswordLogin === 'boolean' ||
         (auth.betterAuth.providers &&
           (typeof auth.betterAuth.providers.google?.enabled === 'boolean' ||
             typeof auth.betterAuth.providers.github?.enabled === 'boolean' ||
@@ -1782,7 +1973,8 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       !hasSessionRebuildUpdate &&
       !hasOAuthServerUpdate &&
       !hasBetterAuthUpdate &&
-      !hasActivityLogUpdate
+      !hasActivityLogUpdate &&
+      !hasNetworkUpdate
     ) {
       res.status(400).json({
         success: false,
@@ -2123,6 +2315,14 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         systemConfig.smartRouting.serverDescriptionMode = normalized === 'full' ? 'full' : 'names';
       }
 
+      // Stored verbatim, not trimmed: the trailing space is part of a task prefix
+      if (typeof smartRouting.embeddingQueryPrefix === 'string') {
+        systemConfig.smartRouting.embeddingQueryPrefix = smartRouting.embeddingQueryPrefix;
+      }
+      if (typeof smartRouting.embeddingDocumentPrefix === 'string') {
+        systemConfig.smartRouting.embeddingDocumentPrefix = smartRouting.embeddingDocumentPrefix;
+      }
+
       if (
         typeof smartRouting.embeddingMaxTokens === 'number' &&
         !isNaN(smartRouting.embeddingMaxTokens)
@@ -2131,6 +2331,53 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       } else if (smartRouting.embeddingMaxTokens === null) {
         // null explicitly clears the override, restoring the per-model default
         systemConfig.smartRouting.embeddingMaxTokens = undefined;
+      }
+
+      // Search-time settings: null clears them back to the default, and none of
+      // them touches the stored embeddings, so they do not trigger a re-sync.
+      if (smartRouting.similarityThreshold === null) {
+        systemConfig.smartRouting.similarityThreshold = undefined;
+      } else if (smartRouting.similarityThreshold !== undefined) {
+        const threshold = parseSimilarityThreshold(smartRouting.similarityThreshold);
+        if (threshold === undefined) {
+          res.status(400).json({
+            success: false,
+            message: 'smartRouting.similarityThreshold must be a number between 0 and 1',
+          });
+          return;
+        }
+        systemConfig.smartRouting.similarityThreshold = threshold;
+      }
+
+      if (smartRouting.fullSchemaTopN === null) {
+        systemConfig.smartRouting.fullSchemaTopN = undefined;
+      } else if (smartRouting.fullSchemaTopN !== undefined) {
+        const topN = parseFullSchemaTopN(smartRouting.fullSchemaTopN);
+        if (topN === undefined) {
+          res.status(400).json({
+            success: false,
+            message: 'smartRouting.fullSchemaTopN must be a non-negative integer',
+          });
+          return;
+        }
+        systemConfig.smartRouting.fullSchemaTopN = topN;
+      }
+
+      if (smartRouting.toolDefinitionFields === null) {
+        systemConfig.smartRouting.toolDefinitionFields = undefined;
+      } else if (smartRouting.toolDefinitionFields !== undefined) {
+        // An array only: the comma-separated form is for the env var
+        const fields = Array.isArray(smartRouting.toolDefinitionFields)
+          ? parseToolDefinitionFields(smartRouting.toolDefinitionFields)
+          : undefined;
+        if (fields === undefined) {
+          res.status(400).json({
+            success: false,
+            message: `smartRouting.toolDefinitionFields must be an array of: ${TOOL_DEFINITION_FIELDS.join(', ')}`,
+          });
+          return;
+        }
+        systemConfig.smartRouting.toolDefinitionFields = fields;
       }
 
       // Check if we need to sync embeddings
@@ -2160,6 +2407,8 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
           systemConfig.smartRouting.azureOpenaiEmbeddingDeployment ||
         previousSmartRoutingConfig.azureOpenaiEmbeddingModel !==
           systemConfig.smartRouting.azureOpenaiEmbeddingModel ||
+        (previousSmartRoutingConfig.embeddingDocumentPrefix ?? '') !==
+          (systemConfig.smartRouting.embeddingDocumentPrefix ?? '') ||
         previousSmartRoutingConfig.embeddingMaxTokens !==
           systemConfig.smartRouting.embeddingMaxTokens;
 
@@ -2287,6 +2536,10 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         target.basePath = auth.betterAuth.basePath.trim();
       }
 
+      if (typeof auth.betterAuth.disablePasswordLogin === 'boolean') {
+        target.disablePasswordLogin = auth.betterAuth.disablePasswordLogin;
+      }
+
       if (Array.isArray(auth.betterAuth.trustedOrigins)) {
         target.trustedOrigins = auth.betterAuth.trustedOrigins
           .filter((origin: any): origin is string => typeof origin === 'string')
@@ -2364,6 +2617,10 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         ...systemConfig.activityLog,
         storeToolPayload: activityLog.storeToolPayload,
       };
+    }
+
+    if (hasNetworkUpdate) {
+      systemConfig.network = { allowedCidrs: [...new Set<string>(network.allowedCidrs)] };
     }
 
     // Save using DAO (supports both file and database modes)

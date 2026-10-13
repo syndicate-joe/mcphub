@@ -8,7 +8,8 @@ const makeOkResult = () => ({
   isError: false,
 });
 
-jest.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
+jest.mock('@modelcontextprotocol/client', () => ({
+  ...jest.requireActual('@modelcontextprotocol/client'),
   Client: jest.fn().mockImplementation(() => {
     const client = {
       connect: jest.fn().mockResolvedValue(undefined),
@@ -22,6 +23,8 @@ jest.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
     mockCreatedClients.push(client);
     return client;
   }),
+  StreamableHTTPClientTransport: MockStreamableHTTPClientTransport,
+  SSEClientTransport: MockSSEClientTransport,
 }));
 
 const mockCreatedTransports: any[] = [];
@@ -57,15 +60,7 @@ class MockStdioClientTransport {
   }
 }
 
-jest.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
-  StreamableHTTPClientTransport: MockStreamableHTTPClientTransport,
-}));
-
-jest.mock('@modelcontextprotocol/sdk/client/sse.js', () => ({
-  SSEClientTransport: MockSSEClientTransport,
-}));
-
-jest.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
+jest.mock('@modelcontextprotocol/client/stdio', () => ({
   StdioClientTransport: MockStdioClientTransport,
 }));
 
@@ -171,19 +166,31 @@ jest.mock('../../src/config/index.js', () => ({
 }));
 
 import * as mcpService from '../../src/services/mcpService.js';
+import { RequestContextService } from '../../src/services/requestContextService.js';
+
+const stateHandle = '65b523af-e4d0-4d99-8e06-461a62a14967';
+const modernCall = (scope = 'credential-A', handle: string | string[] | undefined = stateHandle) =>
+  RequestContextService.getInstance().runWithCustomRequestContext(
+    { headers: { 'x-mcphub-state-id': handle }, stateless: true, clientStateScope: scope },
+    () => callTool(''),
+  );
+
+const modernOpenAiSessionCall = (session: unknown, scope = 'credential-A') =>
+  RequestContextService.getInstance().runWithCustomRequestContext(
+    { headers: {}, stateless: true, clientStateScope: scope },
+    () => callTool('', { 'openai/session': session }),
+  );
 
 // The SIGKILL fallback probes liveness with process.kill(pid, 0). Force it to
 // report "dead" (ESRCH) for our fake pid so the 2s SIGKILL timer never fires.
 const originalProcessKill = process.kill.bind(process);
 const installProcessKillMock = (): void => {
-  jest.spyOn(process, 'kill').mockImplementation(
-    ((pid: number, signal?: string | number) => {
-      if (pid === 4242 && (signal === 0 || signal === undefined)) {
-        throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
-      }
-      return originalProcessKill(pid, signal as any);
-    }) as any,
-  );
+  jest.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: string | number) => {
+    if (pid === 4242 && (signal === 0 || signal === undefined)) {
+      throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    }
+    return originalProcessKill(pid, signal as any);
+  }) as any);
 };
 
 type IsolatedConfig = Record<string, unknown>;
@@ -215,7 +222,7 @@ const makeServerInfo = (config: IsolatedConfig) => {
   } as any;
 };
 
-const callTool = (sessionId: string) =>
+const callTool = (sessionId: string, meta?: Record<string, unknown>) =>
   mcpService.handleCallToolRequest(
     {
       params: {
@@ -224,6 +231,7 @@ const callTool = (sessionId: string) =>
           toolName: 'iso-server::do_thing',
           arguments: {},
         },
+        ...(meta ? { _meta: meta } : {}),
       },
     },
     { sessionId, server: 'iso-server' },
@@ -273,6 +281,215 @@ describe('mcpService per-session client isolation (perSessionClient)', () => {
     expect(serverInfo.sharedClient.callTool).not.toHaveBeenCalled();
   });
 
+  it('reuses modern client state across concurrent requests and isolates scopes and handles', async () => {
+    const info = makeServerInfo({ perSessionClient: true });
+    mcpService.setServerInfosForTest([info]);
+    const results = await Promise.all([modernCall(), modernCall()]);
+    expect(results.every((result) => !result.isError)).toBe(true);
+    expect(mockCreatedClients).toHaveLength(1);
+    await modernCall('credential-B');
+    await modernCall('credential-A', '2f036dc7-734e-43e8-a78f-80821d1dc123');
+    expect(mockCreatedClients).toHaveLength(3);
+    expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it('uses OpenAI conversation metadata as fallback state when the explicit state header is absent', async () => {
+    const info = makeServerInfo({ perSessionClient: true });
+    mcpService.setServerInfosForTest([info]);
+
+    const first = await modernOpenAiSessionCall('v1/work-session-A');
+    const second = await modernOpenAiSessionCall('v1/work-session-A');
+    expect(first.isError).not.toBe(true);
+    expect(second.isError).not.toBe(true);
+    expect(mockCreatedClients).toHaveLength(1);
+
+    await modernOpenAiSessionCall('v1/work-session-B');
+    await modernOpenAiSessionCall('v1/work-session-A', 'credential-B');
+    expect(mockCreatedClients).toHaveLength(3);
+    expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it('does not bypass an invalid explicit state header with OpenAI conversation metadata', async () => {
+    const info = makeServerInfo({ perSessionClient: true });
+    mcpService.setServerInfosForTest([info]);
+    const result = await RequestContextService.getInstance().runWithCustomRequestContext(
+      {
+        headers: { 'x-mcphub-state-id': 'invalid' },
+        stateless: true,
+        clientStateScope: 'credential-A',
+      },
+      () => callTool('', { 'openai/session': 'v1/work-session-A' }),
+    );
+    expect(result.isError).toBe(true);
+    expect(mockCreatedClients).toHaveLength(0);
+    expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '   ', 42, {}, []])(
+    'rejects unusable OpenAI conversation metadata without a shared fallback: %p',
+    async (session) => {
+      const info = makeServerInfo({ perSessionClient: true });
+      mcpService.setServerInfosForTest([info]);
+      const result = await modernOpenAiSessionCall(session);
+      expect(result.isError).toBe(true);
+      expect(mockCreatedClients).toHaveLength(0);
+      expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects OpenAI conversation metadata without an authenticated state scope', async () => {
+    const info = makeServerInfo({ perSessionClient: true });
+    mcpService.setServerInfosForTest([info]);
+    const result = await RequestContextService.getInstance().runWithCustomRequestContext(
+      { headers: {}, stateless: true },
+      () => callTool('', { 'openai/session': 'v1/work-session-A' }),
+    );
+    expect(result.isError).toBe(true);
+    expect(mockCreatedClients).toHaveLength(0);
+    expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, '', 'arbitrary-id', [stateHandle, stateHandle]])(
+    'rejects missing or invalid modern state handles: %p',
+    async (handle) => {
+      const info = makeServerInfo({ perSessionClient: true });
+      mcpService.setServerInfosForTest([info]);
+      const result = await RequestContextService.getInstance().runWithCustomRequestContext(
+        { headers: { 'x-mcphub-state-id': handle }, stateless: true, clientStateScope: 'auth' },
+        () => callTool('spoofed-legacy-id'),
+      );
+      expect(result.isError).toBe(true);
+      expect(mockCreatedClients).toHaveLength(0);
+      expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects unauthenticated state even with a valid handle', async () => {
+    mcpService.setServerInfosForTest([makeServerInfo({ perSessionClient: true })]);
+    const result = await modernCall('');
+    expect(result.isError).toBe(true);
+    expect(mockCreatedClients).toHaveLength(0);
+  });
+
+  it('uses the same isolated state for ordinary and call_tool routing', async () => {
+    const info = makeServerInfo({ perSessionClient: true });
+    mcpService.setServerInfosForTest([info]);
+    await modernCall();
+    const result = await RequestContextService.getInstance().runWithCustomRequestContext(
+      {
+        headers: { 'x-mcphub-state-id': stateHandle },
+        stateless: true,
+        clientStateScope: 'credential-A',
+      },
+      () =>
+        mcpService.handleCallToolRequest(
+          { params: { name: 'iso-server::do_thing', arguments: {} } },
+          {},
+        ),
+    );
+    expect(result.isError).not.toBe(true);
+    expect(mockCreatedClients).toHaveLength(1);
+    expect(mockCreatedClients[0].callTool).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds modern state admission and recovers after idle cleanup without shared fallback', async () => {
+    jest.useFakeTimers();
+    const info = makeServerInfo({ perSessionClient: true });
+    mcpService.setServerInfosForTest([info]);
+    try {
+      for (let i = 0; i < 1000; i++) {
+        expect((await modernCall(`credential-${i}`)).isError).toBe(false);
+      }
+      expect(mockCreatedClients).toHaveLength(1000);
+      const rejected = await modernCall('overflow');
+      expect(rejected.isError).toBe(true);
+      expect(JSON.stringify(rejected.content)).toContain('Client state capacity reached');
+      expect(mockCreatedClients).toHaveLength(1000);
+      expect((await modernCall('credential-0')).isError).toBe(false);
+      expect(mockCreatedClients).toHaveLength(1000);
+      expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+
+      const pinned = mockCreatedClients[0];
+      let finish!: (value: ReturnType<typeof makeOkResult>) => void;
+      pinned.callTool.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const running = modernCall('credential-0');
+      for (let i = 0; i < 100 && !finish; i++) await Promise.resolve();
+      expect(finish).toBeDefined();
+      jest.advanceTimersByTime(31 * 60 * 1000);
+      expect(pinned.close).not.toHaveBeenCalled();
+      expect(
+        mockCreatedClients.slice(1).every((client) => client.close.mock.calls.length === 1),
+      ).toBe(true);
+      expect((await modernCall('overflow')).isError).toBe(false);
+      expect(mockCreatedClients).toHaveLength(1001);
+      finish(makeOkResult());
+      await running;
+      expect((await modernCall('credential-0')).isError).toBe(false);
+      expect(mockCreatedClients).toHaveLength(1001);
+      expect(info.sharedClient.callTool).not.toHaveBeenCalled();
+    } finally {
+      mcpService.cleanupAllServers();
+      jest.useRealTimers();
+    }
+  });
+
+  it('expires idle modern clients but pins running tool calls', async () => {
+    jest.useFakeTimers();
+    mcpService.setServerInfosForTest([makeServerInfo({ perSessionClient: true })]);
+    await modernCall();
+    const client = mockCreatedClients[0];
+    let resolveCall!: (value: ReturnType<typeof makeOkResult>) => void;
+    client.callTool.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCall = resolve;
+        }),
+    );
+    const running = modernCall();
+    for (let i = 0; i < 100 && !resolveCall; i++) await Promise.resolve();
+    expect(resolveCall).toBeDefined();
+    jest.advanceTimersByTime(31 * 60 * 1000);
+    expect(client.close).not.toHaveBeenCalled();
+    resolveCall(makeOkResult());
+    await running;
+    jest.advanceTimersByTime(31 * 60 * 1000);
+    expect(client.close).toHaveBeenCalledTimes(1);
+    await modernCall();
+    expect(mockCreatedClients).toHaveLength(2);
+    mcpService.cleanupAllServers();
+    jest.useRealTimers();
+  });
+
+  it('uses isolated modern cookie jars and clears them on expiry and shutdown', async () => {
+    jest.useFakeTimers();
+    const info = makeServerInfo({ type: 'openapi', openapi: { cookieSession: true } });
+    const jars = new Map<string, number>();
+    info.openApiClient = {
+      callTool: jest.fn(async (_name, _args, _headers, _raw, id: string) => {
+        jars.set(id, (jars.get(id) || 0) + 1);
+        return { calls: jars.get(id) };
+      }),
+      clearSessionCookies: jest.fn((id: string) => jars.delete(id)),
+    };
+    mcpService.setServerInfosForTest([info]);
+    const result = await modernCall();
+    expect(result.isError).not.toBe(true);
+    await modernCall();
+    await modernCall('credential-B');
+    expect([...jars.values()]).toEqual([2, 1]);
+    jest.advanceTimersByTime(31 * 60 * 1000);
+    expect(jars.size).toBe(0);
+    await modernCall();
+    mcpService.cleanupAllServers();
+    expect(jars.size).toBe(0);
+    jest.useRealTimers();
+  });
+
   it('falls back to the shared client when perSessionClient is not set', async () => {
     const serverInfo = makeServerInfo({ perSessionClient: false });
     mcpService.setServerInfosForTest([serverInfo]);
@@ -315,9 +532,7 @@ describe('mcpService per-session client isolation (perSessionClient)', () => {
     mcpService.setServerInfosForTest([serverInfo]);
 
     await callTool('session-A');
-    const stdioTransport = mockCreatedTransports.find(
-      (t) => t instanceof MockStdioClientTransport,
-    );
+    const stdioTransport = mockCreatedTransports.find((t) => t instanceof MockStdioClientTransport);
     expect(stdioTransport).toBeDefined();
 
     mcpService.deleteMcpServer('session-A');
@@ -338,7 +553,7 @@ describe('mcpService per-session client isolation (perSessionClient)', () => {
 
     // Make the next isolated client's handshake fail so we exercise the
     // connect-failure cleanup path (transport + process tree must be torn down).
-    const { Client: MockClient } = jest.requireMock('@modelcontextprotocol/sdk/client/index.js');
+    const { Client: MockClient } = jest.requireMock('@modelcontextprotocol/client');
     MockClient.mockImplementationOnce(() => {
       const client = {
         connect: jest.fn().mockRejectedValue(new Error('handshake failed')),

@@ -764,9 +764,11 @@ const supportBase64Embeddings = async (baseURL: string = ''): Promise<boolean> =
  * you may need to rebuild your vector database indices after switching.
  *
  * @param text Text to generate embeddings for
+ * @param kind Whether the text is a search query or an indexed document; selects the
+ *   configured task prefix (embeddingQueryPrefix / embeddingDocumentPrefix)
  * @returns Promise with vector embedding as number array
  */
-async function generateEmbedding(text: string): Promise<number[]> {
+async function generateEmbedding(text: string, kind: 'query' | 'document'): Promise<number[]> {
   const smartRoutingConfig = await getSmartRoutingConfig();
   applyConfiguredBasePacingDelay(smartRoutingConfig.basePacingDelayMs);
   const provider = smartRoutingConfig.embeddingProvider || 'openai';
@@ -776,6 +778,15 @@ async function generateEmbedding(text: string): Promise<number[]> {
   // and other whitespace that introduce noise into the vector representation,
   // potentially affecting the quality of semantic search results.
   text = text.replace(/\s+/g, ' ').trim();
+
+  // The task prefix goes on after normalization so its trailing space survives, and
+  // before truncation so it is never the part that gets cut. The lexical fallback
+  // embeds the bare text: prefix words would only add noise to it.
+  const prefix =
+    (kind === 'query'
+      ? smartRoutingConfig.embeddingQueryPrefix
+      : smartRoutingConfig.embeddingDocumentPrefix) || '';
+  const input = prefix + text;
 
   if (provider === 'azure_openai') {
     const azureConfig = getAzureOpenAIConfig(smartRoutingConfig);
@@ -787,7 +798,7 @@ async function generateEmbedding(text: string): Promise<number[]> {
 
     try {
       return await withEmbeddingQueue(() =>
-        executeWithRetry(() => generateAzureOpenAIEmbedding(text, smartRoutingConfig), {
+        executeWithRetry(() => generateAzureOpenAIEmbedding(input, smartRoutingConfig), {
           provider: 'azure_openai',
           model: smartRoutingConfig.azureOpenaiEmbeddingModel,
           baseURL: azureConfig.endpoint,
@@ -828,7 +839,7 @@ async function generateEmbedding(text: string): Promise<number[]> {
   const _truncateStart = Date.now();
   try {
     truncatedText = await truncateToTokenLimit(
-      text,
+      input,
       maxTokens,
       config.embeddingModel,
       config.apiKey,
@@ -841,10 +852,10 @@ async function generateEmbedding(text: string): Promise<number[]> {
     );
     // As a fallback, use the shared conservative character-based heuristic (~3 chars/token)
     // to prevent oversized text from causing a failure in the embedding API call.
-    truncatedText = truncateWithHeuristic(text, maxTokens);
+    truncatedText = truncateWithHeuristic(input, maxTokens);
   }
   logger.debug(
-    `[Embedding] Truncation: ${text.length} → ${truncatedText.length} chars (${Date.now() - _truncateStart}ms, maxTokens=${maxTokens})`,
+    `[Embedding] Truncation: ${input.length} → ${truncatedText.length} chars (${Date.now() - _truncateStart}ms, maxTokens=${maxTokens})`,
   );
 
   // Determine encoding format based on configuration
@@ -1069,7 +1080,7 @@ const stableHashSerialize = (value: unknown): string => {
   return JSON.stringify(value);
 };
 
-export const buildToolSetHash = (tools: Tool[]): string => {
+export const buildToolSetHash = (tools: Tool[], documentPrefix = ''): string => {
   // Exclude raw upstream descriptions from the hash — some MCP servers (e.g.
   // Wiz, Cortex) inject dynamic content into descriptions (permission checks,
   // scope warnings) that changes on every connection, causing cache misses and
@@ -1089,12 +1100,16 @@ export const buildToolSetHash = (tools: Tool[]): string => {
       description: tool.hasDescriptionOverride ? (tool.description ?? '') : null,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+  // The document prefix is part of what gets embedded, so changing it must invalidate
+  // the stored rows. It only joins the hash when set, so hashes computed before the
+  // setting existed stay valid.
+  const hashInput = documentPrefix ? { tools: normalized, documentPrefix } : normalized;
 
   // Derive the cache key with a memory-hard KDF (scrypt) rather than a bare
   // digest: inputs may embed configuration-derived content, so a deliberately
   // expensive keyed derivation is the appropriate construction. Parameters
   // are tuned down (~2ms) because this runs on tool-set refreshes only.
-  return scryptSync(stableHashSerialize(normalized), TOOLSET_HASH_KEY, 32, {
+  return scryptSync(stableHashSerialize(hashInput), TOOLSET_HASH_KEY, 32, {
     N: 2048,
     r: 8,
     p: 1,
@@ -1140,6 +1155,25 @@ const parseEmbeddingMetadata = (metadata: unknown): Record<string, any> | null =
  * @param serverName Server name
  * @param tools Array of tools to save
  */
+/** The text a tool is embedded from, and stored as its row's text_content. */
+const buildToolSearchableText = (tool: Tool): string =>
+  [
+    tool.name,
+    tool.description,
+    // Include input schema properties if available
+    ...(tool.inputSchema && typeof tool.inputSchema === 'object'
+      ? Object.keys(tool.inputSchema).filter((key) => key !== 'type' && key !== 'properties')
+      : []),
+    // Include schema property names if available
+    ...(tool.inputSchema &&
+    tool.inputSchema.properties &&
+    typeof tool.inputSchema.properties === 'object'
+      ? Object.keys(tool.inputSchema.properties)
+      : []),
+  ]
+    .filter(Boolean)
+    .join(' ');
+
 export const saveToolsAsVectorEmbeddings = async (
   serverName: string,
   tools: Tool[],
@@ -1200,7 +1234,48 @@ export const saveToolsAsVectorEmbeddings = async (
     const expectedContentIds = tools
       .map((tool) => `${serverName}:${tool.name}`)
       .sort((a, b) => a.localeCompare(b));
-    const expectedToolSetHash = buildToolSetHash(tools);
+    const expectedToolSetHash = buildToolSetHash(tools, smartRoutingConfig.embeddingDocumentPrefix);
+
+    // ── Partial updates: only embed tools whose row is missing or out of date ──
+    // A partial list is one view of the server's index (a single tool update, or
+    // the tools one user's credentials list), so the whole-set check below can
+    // never match it. Compare per tool instead: same content id, model and text.
+    if (options.partial && isDatabaseConnected()) {
+      try {
+        const partialRepo = getRepositoryFactory('vectorEmbeddings')() as VectorEmbeddingRepository;
+        const existingText = new Map(
+          (
+            await partialRepo.getToolIdentityByServerNameAndModel(
+              serverName,
+              persistedEmbeddingModel,
+            )
+          ).map((item) => [item.contentId, item.textContent]),
+        );
+        const staleTools = tools.filter(
+          (tool) =>
+            existingText.get(`${serverName}:${tool.name}`) !== buildToolSearchableText(tool),
+        );
+        const serverEmbStatus = await partialRepo.findEmbeddingStatus('server', serverName);
+        const hasCurrentServerEmbedding =
+          serverEmbStatus?.model === persistedEmbeddingModel &&
+          serverEmbStatus.text_content === serverSearchableText &&
+          serverEmbStatus.hasEmbedding === true;
+        if (staleTools.length === 0 && hasCurrentServerEmbedding) {
+          logger.log(
+            `[Embedding] [${serverName}] Skipping — all ${tools.length} tool(s) of the partial update already indexed (model=${persistedEmbeddingModel})`,
+          );
+          return;
+        }
+        logger.log(
+          `[Embedding] [${serverName}] Partial update: embedding ${staleTools.length} of ${tools.length} tool(s) (model=${persistedEmbeddingModel})`,
+        );
+        tools = staleTools;
+      } catch (partialCheckError: any) {
+        logger.warn(
+          `[Embedding] [${serverName}] Partial freshness check failed, embedding every listed tool: ${partialCheckError?.message ?? partialCheckError}`,
+        );
+      }
+    }
 
     // ── Skip check: avoid regenerating embeddings that are already up-to-date ──
     // Validate exact content IDs and a tool-set hash/version marker to avoid
@@ -1208,7 +1283,7 @@ export const saveToolsAsVectorEmbeddings = async (
     // This is an optimization to skip the expensive embedding generation phase when
     // nothing changed, which can save a lot of time for servers with many tools and
     // slow embedding providers. It also prevents rewrites on every server restart.
-    if (isDatabaseConnected()) {
+    if (!options.partial && isDatabaseConnected()) {
       try {
         const skipCheckRepo = getRepositoryFactory(
           'vectorEmbeddings',
@@ -1281,30 +1356,14 @@ export const saveToolsAsVectorEmbeddings = async (
     for (let _toolIdx = 0; _toolIdx < tools.length; _toolIdx++) {
       const tool = tools[_toolIdx];
 
-      // Create searchable text from tool information
-      const searchableText = [
-        tool.name,
-        tool.description,
-        // Include input schema properties if available
-        ...(tool.inputSchema && typeof tool.inputSchema === 'object'
-          ? Object.keys(tool.inputSchema).filter((key) => key !== 'type' && key !== 'properties')
-          : []),
-        // Include schema property names if available
-        ...(tool.inputSchema &&
-        tool.inputSchema.properties &&
-        typeof tool.inputSchema.properties === 'object'
-          ? Object.keys(tool.inputSchema.properties)
-          : []),
-      ]
-        .filter(Boolean)
-        .join(' ');
+      const searchableText = buildToolSearchableText(tool);
 
       logger.debug(
         `[Embedding] [${serverName}] Tool ${_toolIdx + 1}/${tools.length}: "${tool.name}" | raw text: ${searchableText.length} chars | preview: "${searchableText.substring(0, 200).replace(/\s+/g, ' ')}"`,
       );
 
       try {
-        const embedding = await generateEmbedding(searchableText);
+        const embedding = await generateEmbedding(searchableText, 'document');
         toolEmbeddings.push({ tool, searchableText, embedding });
         emitProgress(_toolIdx + 1, 'in_progress');
       } catch (error: any) {
@@ -1322,7 +1381,7 @@ export const saveToolsAsVectorEmbeddings = async (
 
     let serverEmbedding: number[];
     try {
-      serverEmbedding = await generateEmbedding(serverSearchableText);
+      serverEmbedding = await generateEmbedding(serverSearchableText, 'document');
     } catch (error: any) {
       const status = extractErrorStatus(error);
       logger.warn('[EMBED_SYNC_ERROR] Failed while embedding server metadata', {
@@ -1442,7 +1501,10 @@ export const searchToolsByVector = async (
     toolName: string;
     description: string;
     inputSchema: any;
+    /** Ranking score: tool similarity blended with its server's similarity. */
     similarity: number;
+    /** Raw query-to-tool cosine similarity, the value the threshold is applied to. */
+    toolSimilarity: number;
     searchableText: string;
   }>
 > => {
@@ -1450,7 +1512,7 @@ export const searchToolsByVector = async (
     const vectorRepository = getRepositoryFactory(
       'vectorEmbeddings',
     )() as VectorEmbeddingRepository;
-    const queryEmbedding = await generateEmbedding(query);
+    const queryEmbedding = await generateEmbedding(query, 'query');
 
     // Scope the search in SQL, not after the fact: `limit` has to count rows the
     // caller can actually use. Embeddings are keyed per server, and the same tool
@@ -1508,6 +1570,7 @@ export const searchToolsByVector = async (
               serverSimilarityBoost !== undefined
                 ? result.similarity * 0.8 + serverSimilarityBoost * 0.2
                 : result.similarity,
+            toolSimilarity: result.similarity,
             searchableText: result.embedding.text_content,
           };
         }
@@ -1536,6 +1599,7 @@ export const searchToolsByVector = async (
             serverSimilarityBoost !== undefined
               ? result.similarity * 0.8 + serverSimilarityBoost * 0.2
               : result.similarity,
+          toolSimilarity: result.similarity,
           searchableText: textContent,
         };
       })
@@ -1690,6 +1754,41 @@ export const removeServerToolEmbeddings = async (serverName: string): Promise<vo
     logger.log('Removed server embeddings', safeStringify({ serverName, removedCount }));
   } catch (error) {
     logger.error('Error removing server embeddings', safeStringify({ serverName, error }));
+  }
+};
+
+/**
+ * Remove the embeddings of specific tools of a server, e.g. tools disabled in
+ * its config, without touching its other rows.
+ * @param serverName Server name
+ * @param toolNames Tool names as cached (`<server><separator><tool>`)
+ */
+export const removeToolEmbeddings = async (
+  serverName: string,
+  toolNames: string[],
+): Promise<void> => {
+  if (toolNames.length === 0) return;
+  try {
+    const smartRoutingConfig = await getSmartRoutingConfig();
+    if (!smartRoutingConfig.dbUrl && !process.env.DB_URL) {
+      return;
+    }
+
+    if (!isDatabaseConnected()) {
+      await initializeDatabase();
+    }
+
+    const vectorRepository = getRepositoryFactory(
+      'vectorEmbeddings',
+    )() as VectorEmbeddingRepository;
+    const removedCount = await vectorRepository.deleteToolEmbeddingsByContentIds(
+      toolNames.map((toolName) => `${serverName}:${toolName}`),
+    );
+    if (removedCount > 0) {
+      logger.log(`[Embedding] [${serverName}] Removed ${removedCount} disabled tool embedding(s)`);
+    }
+  } catch (error) {
+    logger.error('Error removing tool embeddings', safeStringify({ serverName, toolNames, error }));
   }
 };
 
@@ -1896,7 +1995,9 @@ async function checkDatabaseVectorDimensions(dimensionsNeeded: number): Promise<
     return false;
   } catch (error: any) {
     logger.error('Error checking or updating vector dimensions', { error });
-    throw new Error(`Vector dimension check failed: ${error?.message || 'Unknown error'}`);
+    throw new Error(`Vector dimension check failed: ${error?.message || 'Unknown error'}`, {
+      cause: error,
+    });
   }
 }
 

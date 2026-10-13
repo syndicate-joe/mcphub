@@ -204,6 +204,69 @@ It multiplies upstream connections (and stdio child processes) by the number of
 concurrent sessions, so leave it off for stateless servers.
 </Tip>
 
+### Routing headers over MCP 2026-07-28
+
+Modern requests use `MCP-Protocol-Version: 2026-07-28` and `Mcp-Method`
+matching the JSON-RPC method. `tools/call` and `prompts/get` also require
+`Mcp-Name` matching `params.name`; `resources/read` requires it to match
+`params.uri`. List methods do not require `Mcp-Name`. The SDK v2 HTTP client
+sets these headers automatically.
+
+For example, a tool call to `/mcp` with `params.name` set to
+`my-server-my-tool` sends:
+
+```http
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: my-server-my-tool
+```
+
+These headers accompany the normal JSON-RPC body, including the modern
+`params._meta` protocol-version and client-capability envelope. They do not
+select a group or grant access: the URL and bearer permissions still determine
+the available servers. On a server-specific URL, use the tool name exposed by
+that URL in both the body and header. Non-ASCII names use the SDK's
+`=?base64?<UTF-8 Base64>?=` encoding in `Mcp-Name`.
+
+Missing required headers, header/body mismatches and invalid name encodings
+return HTTP 400 with JSON-RPC error `-32020` before dispatch. Legacy
+`2025-11-25` requests retain their existing handshake and session behavior and
+do not require these routing headers.
+
+### Stateful tools over MCP 2026-07-28
+
+Modern MCP requests do not create a downstream transport session. To call tools
+on servers with `perSessionClient: true` or OpenAPI `cookieSession: true`, enable
+bearer authentication and send `X-MCPHub-State-Id` with a client-generated UUID v4
+on each request that belongs to the same application workflow. For example:
+
+```http
+Authorization: Bearer <your-key>
+X-MCPHub-State-Id: 65b523af-e4d0-4d99-8e06-461a62a14967
+```
+
+This is an MCPHub extension, independent of `Mcp-Session-Id` and the MCP handshake.
+The same state ID reuses isolated upstream clients and cookie jars only within
+the same bearer credential, user and route. Use a different UUID for each
+independent workflow.
+
+Authenticated OpenAI/ChatGPT tool calls that cannot set this extension may omit
+it and send the client-declared `_meta["openai/session"]` conversation hint that
+ChatGPT includes with tool calls. MCPHub hashes the hint before using it for state
+correlation. The hint never authenticates or authorizes a request, and reuse is
+still bounded by the verified bearer credential, user and route. If
+`X-MCPHub-State-Id` is present but invalid, MCPHub fails closed instead of falling
+back. If neither usable correlation value is present, stateful tools return a tool
+error. Other tools need no state ID.
+
+State lives in memory on one MCPHub process. It expires after 30 minutes without
+an active call; running calls pin their state until completion. Expiry and shutdown
+close isolated upstream clients and clear cookie jars. The process admits at most
+1,000 modern state scopes; excess scopes receive a tool error until capacity is
+available. Restart, expiry, bearer rotation or a route change starts fresh state.
+Use sticky routing when running multiple replicas. Legacy `2025-11-25` clients
+continue using their existing downstream session lifecycle.
+
 ### File and System Servers
 
 #### Filesystem Server
@@ -502,7 +565,7 @@ In file mode, MCPHub re-reads `mcp_settings.json` when it changes, without a res
 - **System settings** (`systemConfig`, e.g. `nameSeparator`) are picked up on the next read once the file has changed.
 - Settings that are read once at process startup still require a restart to take effect: the Better Auth bootstrap, `skipAuth`, the listening port, and anything driven by environment variables.
 
-In database mode (`USE_DB=true`), `mcp_settings.json` is only a one-time seed; edit configuration through the dashboard, API, or CLI instead.
+In database mode, `mcp_settings.json` is a one-time seed by default. Set `MCPHUB_SETTINGS_SYNC=upsert` to apply server and group declarations on each startup; see [declarative database configuration](/configuration/database-configuration#declarative-servers-and-groups-gitops) for precedence and OAuth state handling.
 
 {/* ### Access Control
 
@@ -718,3 +781,40 @@ Common validation errors and solutions:
 4. **Command not found**: Verify installation and PATH */}
 
 This comprehensive guide covers all aspects of configuring MCP servers in MCPHub for various use cases and environments.
+
+### Stdio response buffer
+
+Set `options.maxBufferSize` to a positive safe integer in bytes to allow larger stdio responses:
+
+```json
+{
+  "type": "stdio",
+  "command": "node",
+  "args": ["server.js"],
+  "options": { "maxBufferSize": 268435456 }
+}
+```
+
+Omitting this option retains the SDK default of 10 MiB (10485760 bytes). The limit applies to the read buffer containing the serialized MCP message, including its envelope. A response that exceeds the limit closes the transport. Raising the limit allows greater memory use; choose a finite limit appropriate for the server. Zero, negative values, fractions, and non-finite values are rejected. This option does not change HTTP transports or the SDK's large-message processing performance.
+
+## Allowing internal upstream networks
+
+Administrators can maintain **Allowed upstream CIDR ranges** in Settings, or set `systemConfig.network.allowedCidrs` in JSON storage:
+
+```json
+{
+  "systemConfig": {
+    "network": {
+      "allowedCidrs": ["192.168.1.0/24", "fd00:1234::/64"]
+    }
+  }
+}
+```
+
+The list defaults to empty. It permits all users' upstream MCP (SSE and Streamable HTTP), OpenAPI, and upstream OAuth requests to addresses in those ranges. Public addresses remain accessible; admin-owned servers retain their existing unrestricted internal-network access. Server visibility and sharing permissions are unchanged.
+
+Each entry must be an IPv4 or IPv6 address with a prefix length (for example `/32` for one IPv4 address or `/128` for one IPv6 address). All DNS answers, each redirect destination, and connection-time DNS answers are checked. Removing a range affects subsequent requests, but does not close existing connections or clear cached data. Anonymous OAuth client metadata (CIMD) URLs remain restricted to public addresses.
+
+Only admins can update the list through `PUT /api/system-config` with `{"network":{"allowedCidrs":["192.168.1.0/24"]}}`. Sending an empty array clears it. Invalid lists return HTTP 400 without saving. Database installations should use the dashboard or API; the field is stored in the system configuration table.
+
+Use the smallest necessary ranges. Broad ranges such as `0.0.0.0/0` or `::/0` also allow sensitive internal destinations, including loopback and cloud metadata endpoints.

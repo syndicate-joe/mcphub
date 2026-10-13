@@ -260,6 +260,10 @@ export const useMarketData = () => {
   // Install server to the local environment
   const installServer = useCallback(
     async (server: MarketServer, customConfig: ServerConfig) => {
+      if (server.kind === 'skill') {
+        setError(t('market.skillDescription'));
+        return false;
+      }
       try {
         const installType = server.installations?.npm
           ? 'npm'

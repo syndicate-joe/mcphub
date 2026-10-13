@@ -53,7 +53,7 @@ MCPHub offre une manière unifiée de connecter et de gérer plusieurs serveurs 
 ### Prérequis
 
 - **Docker** (recommandé) — le moyen le plus rapide d'exécuter MCPHub ; toutes les commandes ci-dessous l'utilisent
-- **Node.js** `^18.0.0 || >=20.0.0` et **pnpm** `10.12.4` — uniquement pour exécuter depuis les sources ou développer localement (voir [Développement local](#développement-local))
+- **Node.js** `>=20.0.0` et **pnpm** `10.12.4` — uniquement pour exécuter depuis les sources ou développer localement (voir [Développement local](#développement-local))
 
 ### Démarrer avec Docker
 
@@ -169,9 +169,15 @@ Les contributions sont les bienvenues ! Rejoignez notre [communauté Discord](ht
 
 ## ❤️ Sponsor
 
+[![Sponsor samanhappy](https://img.shields.io/badge/Sponsor-samanhappy-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/samanhappy)
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/samanhappy)
 
 Les utilisateurs en Chine peuvent aussi soutenir via WeChat Pay — voir [中文版](README.zh.md).
+
+## Remerciements
+
+- [AtomGit](https://atomgit.com/samanhappy/mcphub) : héberge MCPHub en Chine et facilite l’accès au projet pour les utilisateurs en Chine continentale.
 
 ## 🌟 Historique des étoiles
 

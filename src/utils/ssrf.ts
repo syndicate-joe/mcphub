@@ -1,5 +1,9 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
+import { BlockList, isIP, type LookupFunction } from 'node:net';
+import { Agent as HttpAgent } from 'node:http';
+import { Agent as HttpsAgent } from 'node:https';
+import { Agent } from 'undici';
+import { getCachedSystemConfig } from './systemConfigCache.js';
 
 export class UnsafeUrlError extends Error {
   constructor(message: string) {
@@ -16,13 +20,45 @@ export interface AssertSafeUrlOptions {
   // need to reach internal services.
   allowInternal?: boolean;
   lookup?: SsrfLookup;
+  allowedCidrs?: string[];
+}
+
+export function validateAllowedCidrs(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((cidr) => {
+      if (typeof cidr !== 'string') return false;
+      const [address, prefix] = cidr.split('/');
+      const family = isIP(address);
+      return (
+        cidr.split('/').length === 2 &&
+        family !== 0 &&
+        /^(0|[1-9]\d*)$/.test(prefix) &&
+        Number(prefix) <= (family === 4 ? 32 : 128)
+      );
+    })
+  );
+}
+
+// Read on each request/socket lookup so removing a range also affects existing clients.
+function isDisallowedIp(ip: string, allowedCidrs?: string[]): boolean {
+  if (!isIP(ip)) return true;
+  if (!isBlockedIp(ip)) return false;
+  const cidrs = allowedCidrs ?? getCachedSystemConfig()?.network?.allowedCidrs ?? [];
+  if (!validateAllowedCidrs(cidrs)) return true;
+  const blockList = new BlockList();
+  for (const cidr of cidrs) {
+    const [address, prefix] = cidr.split('/');
+    blockList.addSubnet(address, Number(prefix), isIP(address) === 4 ? 'ipv4' : 'ipv6');
+  }
+  return !blockList.check(ip, isIP(ip) === 4 ? 'ipv4' : 'ipv6');
 }
 
 // IPv4 blocked ranges as [start, end] inclusive 32-bit integers.
 const IPV4_BLOCKED_RANGES: Array<[number, number]> = [
   [0x00000000, 0x00ffffff], // 0.0.0.0/8 unspecified
   [0x0a000000, 0x0affffff], // 10.0.0.0/8 RFC1918
-  [0x64000000, 0x657fffff], // 100.64.0.0/10 CGNAT
+  [0x64400000, 0x647fffff], // 100.64.0.0/10 CGNAT (100.64.0.0 - 100.127.255.255)
   [0x7f000000, 0x7fffffff], // 127.0.0.0/8 loopback
   [0xa9fe0000, 0xa9feffff], // 169.254.0.0/16 link-local (IMDS)
   [0xac100000, 0xac1fffff], // 172.16.0.0/12 RFC1918
@@ -103,11 +139,48 @@ const defaultLookup: SsrfLookup = async (host) => {
   return records.map((r) => r.address);
 };
 
+/** Validate the very DNS result handed to the socket, without a second resolution. */
+export const createSafeLookup =
+  (lookup: SsrfLookup = defaultLookup, allowedCidrs?: string[]): LookupFunction =>
+  (hostname, options, callback) => {
+    void lookup(hostname)
+      .then((addresses) => {
+        if (!addresses.length || addresses.some((ip) => isDisallowedIp(ip, allowedCidrs))) {
+          throw new UnsafeUrlError(`Blocked or empty DNS result for ${hostname}`);
+        }
+        const records = addresses
+          .map((address) => ({ address, family: isIP(address) }))
+          .filter((record) => !options.family || record.family === options.family);
+        if (!records.length) throw new UnsafeUrlError(`No matching address for ${hostname}`);
+        if (options.all) callback(null, records);
+        else callback(null, records[0].address, records[0].family);
+      })
+      .catch((error: Error) => callback(error, []));
+  };
+
+const safeLookup = createSafeLookup();
+const safeDispatcher = new Agent({ connect: { lookup: safeLookup } });
+const publicOnlyDispatcher = new Agent({
+  connect: { lookup: createSafeLookup(defaultLookup, []) },
+});
+const safeHttpAgent = new HttpAgent({ lookup: safeLookup });
+const safeHttpsAgent = new HttpsAgent({ lookup: safeLookup });
+
+/** Proxy-side DNS cannot enforce this boundary; guarded requests connect directly. */
+export const ssrfConnectionOptions = (allowInternal: boolean) =>
+  allowInternal
+    ? {}
+    : {
+        httpAgent: safeHttpAgent,
+        httpsAgent: safeHttpsAgent,
+        proxy: false as const,
+      };
+
 export async function assertSafeUrl(
   rawUrl: string,
   opts: AssertSafeUrlOptions = {},
 ): Promise<string> {
-  const { allowInternal = false, lookup = defaultLookup } = opts;
+  const { allowInternal = false, lookup = defaultLookup, allowedCidrs } = opts;
 
   let parsed: URL;
   try {
@@ -124,9 +197,9 @@ export async function assertSafeUrl(
     return parsed.href;
   }
 
-  const host = parsed.hostname;
+  const host = parsed.hostname.replace(/^\[|\]$/g, '');
   if (isIP(host) !== 0) {
-    if (isBlockedIp(host)) {
+    if (isDisallowedIp(host, allowedCidrs)) {
       throw new UnsafeUrlError(`Blocked target IP: ${host}`);
     }
     return parsed.href;
@@ -142,7 +215,7 @@ export async function assertSafeUrl(
     throw new UnsafeUrlError(`No addresses resolved for host: ${host}`);
   }
   for (const addr of addresses) {
-    if (isBlockedIp(addr)) {
+    if (isDisallowedIp(addr, allowedCidrs)) {
       throw new UnsafeUrlError(`Host ${host} resolves to blocked address: ${addr}`);
     }
   }
@@ -161,13 +234,25 @@ export function createRedirectValidatingFetch(
   baseFetch: FetchLike,
   allowInternal: boolean,
   lookup: SsrfLookup = defaultLookup,
+  allowedCidrs?: string[],
 ): FetchLike {
   const maxHops = 5;
+  const dispatcher = allowInternal
+    ? undefined
+    : lookup === defaultLookup && allowedCidrs === undefined
+      ? safeDispatcher
+      : lookup === defaultLookup && allowedCidrs?.length === 0
+        ? publicOnlyDispatcher
+        : new Agent({ connect: { lookup: createSafeLookup(lookup, allowedCidrs) } });
   return async (url, init) => {
     let currentUrl = typeof url === 'string' ? url : url.toString();
     let hops = 0;
-    currentUrl = await assertSafeUrl(currentUrl, { allowInternal, lookup });
-    let response = await baseFetch(currentUrl, { ...init, redirect: 'manual' });
+    currentUrl = await assertSafeUrl(currentUrl, { allowInternal, lookup, allowedCidrs });
+    let response = await baseFetch(currentUrl, {
+      ...init,
+      ...(dispatcher ? { dispatcher } : {}),
+      redirect: 'manual',
+    });
     while (
       response.status >= 300 &&
       response.status < 400 &&
@@ -179,9 +264,13 @@ export function createRedirectValidatingFetch(
         return response;
       }
       const resolvedUrl = new URL(location, currentUrl).toString();
-      currentUrl = await assertSafeUrl(resolvedUrl, { allowInternal, lookup });
+      currentUrl = await assertSafeUrl(resolvedUrl, { allowInternal, lookup, allowedCidrs });
       hops++;
-      response = await baseFetch(currentUrl, { ...init, redirect: 'manual' });
+      response = await baseFetch(currentUrl, {
+        ...init,
+        ...(dispatcher ? { dispatcher } : {}),
+        redirect: 'manual',
+      });
     }
     if (response.status >= 300 && response.status < 400 && response.status !== 304) {
       throw new UnsafeUrlError('Too many redirects');

@@ -15,6 +15,14 @@ module.exports = {
         tsconfig: './tsconfig.test.json',
       },
     ],
+    // jose ships ESM only; compile it to CommonJS for the Jest runtime. The
+    // separators are a class because Jest matches Windows paths with backslashes.
+    '^.+[\\\\/]node_modules[\\\\/]jose[\\\\/]dist[\\\\/].+\\.js$': [
+      'ts-jest',
+      {
+        tsconfig: { allowJs: true, module: 'commonjs', target: 'ES2022', isolatedModules: true },
+      },
+    ],
   },
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
   setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
@@ -41,7 +49,9 @@ module.exports = {
     '^(\\.{1,2}/.*)\\.js$': '$1',
     '^uuid$': '<rootDir>/tests/shims/uuid.ts',
   },
-  transformIgnorePatterns: ['node_modules/(?!(@modelcontextprotocol|openid-client|oauth4webapi)/)'],
+  transformIgnorePatterns: [
+    'node_modules/(?!(\\.pnpm/[^/]+/node_modules/)?(@modelcontextprotocol|openid-client|oauth4webapi|jose)/)',
+  ],
   extensionsToTreatAsEsm: ['.ts'],
   testTimeout: 30000,
   verbose: true,

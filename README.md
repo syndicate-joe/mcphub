@@ -56,7 +56,7 @@ It works with MCP clients such as Claude Code, Cursor, Cherry Studio, OpenWebUI,
 ### Prerequisites
 
 - **Docker** (recommended) — the fastest way to run MCPHub; all commands below use it
-- **Node.js** `^18.0.0 || >=20.0.0` and **pnpm** `10.12.4` — only needed to run from source or develop locally (see [Local Development](#local-development))
+- **Node.js** `>=20.0.0` and **pnpm** `10.12.4` — only needed to run from source or develop locally (see [Local Development](#local-development))
 
 ### Start with Docker
 
@@ -182,9 +182,15 @@ Contributions welcome! See our [Discord community](https://discord.gg/2BJehJZVH5
 
 ## ❤️ Sponsor
 
+[![Sponsor samanhappy](https://img.shields.io/badge/Sponsor-samanhappy-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/samanhappy)
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/samanhappy)
 
 Chinese users can also support via WeChat Pay — see [中文版](README.zh.md).
+
+## Acknowledgements
+
+- [AtomGit](https://atomgit.com/samanhappy/mcphub): Hosts MCPHub in China, making the project easier to access for users in mainland China.
 
 ## 🌟 Star History
 

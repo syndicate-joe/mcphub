@@ -10,6 +10,11 @@ import type { HostedAuthContext } from './hostedAuthService.js';
 export interface RequestContext {
   headers: Record<string, string | string[] | undefined>;
   sessionId?: string;
+  /** Set only after HTTP authentication and modern-protocol classification. */
+  clientStateScope?: string;
+  stateless?: boolean;
+  /** Per-request client capabilities declared by 2026-07-28 stateless clients. */
+  clientCapabilities?: unknown;
   userAgent?: string;
   remoteAddress?: string;
   group?: string;

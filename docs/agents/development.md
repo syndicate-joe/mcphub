@@ -37,4 +37,57 @@ The backend listens on `:3000` unless `PORT` is set. The frontend dev server lis
 - Use `pnpm backend:build` for the full TypeScript error output.
 - For a port conflict, change `PORT` or identify and stop the process holding the port.
 
-The supported Node.js range is `^18.0.0 || >=20.0.0`; CI uses Node 20.x and the published Docker image uses Node 22.
+## Agent shell `PATH`
+
+Agent bash shells run non-interactively with a minimal `PATH` and do not load
+the user's shell profile, so bare `gh`, `pnpm`, `node`, or `npx` can report
+`command not found` **even when the user has them installed** — this is not an
+install problem and varies by machine. First confirm what resolves and where
+the rest lives:
+
+```bash
+command -v gh pnpm node git curl
+ls ~/.nvm/versions/node/*/bin 2>/dev/null   # nvm-managed Node toolchain
+ls /opt/homebrew/bin 2>/dev/null            # Homebrew (Apple Silicon)
+ls /usr/local/bin 2>/dev/null               # Homebrew (Intel macOS) / other prefixes
+```
+
+Export the directories that hold the toolchain, then rerun the failed command.
+On this repo's primary development machine that is:
+
+```bash
+export PATH="/opt/homebrew/bin:$HOME/.nvm/versions/node/v24.15.0/bin:$PATH"
+gh issue view 643
+pnpm backend:build
+```
+
+If the exports still do not resolve the tools, ask the user for the install
+location instead of guessing.
+
+## Agent shell file sandbox
+
+Agent bash shells also run under a file sandbox that denies writes outside the
+repo workspace (default policy: workspace-write). Commands that succeed in the
+user's own terminal can fail here purely because of the sandbox:
+
+- `npx -y <pkg>` fails with `EPERM` on `~/.npm/_cacache/tmp/***`. npm's
+  "Your cache folder contains root-owned files" message is misleading — the
+  files are user-owned; `touch ~/.npm/_cacache/tmp/x` returning
+  `Operation not permitted` is the sandbox denying the write.
+- Any other tool that writes a cache under the user's home (`uvx`, pip, …)
+  is subject to the same restriction.
+
+This breaks `pnpm test` runs when a suite spawns a real MCP server via `npx`:
+`tests/integration/sse-service-real-client.test.ts` uses `npx -y time-mcp`
+(see `tests/utils/mockSettings.ts`), so the upstream never starts and the
+suite's `beforeAll` hooks time out (60s), even though the identical run
+passes in the user's terminal.
+
+Workarounds, in order of preference:
+
+1. Redirect the tool's cache into the workspace, e.g.
+   `NPM_CONFIG_CACHE=<workspace>/.npm-cache-test pnpm test <suite>`;
+   delete the cache directory afterwards.
+2. Request a wider sandbox permission for the run.
+
+The supported Node.js range is `>=20.0.0`; CI tests Node 20.x and 22.x; the published Docker image uses Node 22.

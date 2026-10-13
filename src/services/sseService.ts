@@ -1,10 +1,18 @@
 import { Request, Response } from 'express';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { canAccessGroupRoute } from '../utils/groupAccess.js';
-import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import {
+  NodeStreamableHTTPServerTransport,
+  toNodeHandler,
+  toWebRequest,
+} from '@modelcontextprotocol/node';
+import { SSEServerTransport } from '@modelcontextprotocol/server-legacy/sse';
+import {
+  Transport,
+  createMcpHandler,
+  isInitializeRequest,
+  isLegacyRequest,
+} from '@modelcontextprotocol/server';
 import { deleteMcpServer, getMcpServer } from './mcpService.js';
 import config from '../config/index.js';
 import {
@@ -27,6 +35,7 @@ import {
 } from './hostedAuthService.js';
 import type { HostedAuthContext } from './hostedAuthService.js';
 import { isHostedModeEnabled } from './hostedMode.js';
+import { authenticateForwardAuthToken } from './forwardAuthService.js';
 import { logger } from '../utils/logger.js';
 
 export interface SessionContext {
@@ -52,6 +61,7 @@ const SESSION_NOT_FOUND_MESSAGE = 'Session not found. Please reinitialize the se
  * authentication method instead of leaving the field blank.
  */
 const OAUTH_AUTH_METHOD_LABEL = 'OAuth';
+const FORWARD_AUTH_METHOD_LABEL = 'Forward auth';
 
 type RehydratableWebStandardTransport = {
   sessionId?: string;
@@ -59,7 +69,45 @@ type RehydratableWebStandardTransport = {
 };
 
 // Session creation locks to prevent concurrent session creation conflicts
-const sessionCreationLocks: { [sessionId: string]: Promise<StreamableHTTPServerTransport> } = {};
+const sessionCreationLocks: { [sessionId: string]: Promise<NodeStreamableHTTPServerTransport> } =
+  {};
+
+let modernMcpHandler: ReturnType<typeof createMcpHandler> | undefined;
+let modernMcpNodeHandler: ReturnType<typeof toNodeHandler> | undefined;
+
+const getModernMcpNodeHandler = (): ReturnType<typeof toNodeHandler> => {
+  if (modernMcpNodeHandler) {
+    return modernMcpNodeHandler;
+  }
+
+  modernMcpHandler = createMcpHandler(
+    async () => {
+      const requestContextService = RequestContextService.getInstance();
+      return getMcpServer(undefined, requestContextService.getGroupContext());
+    },
+    {
+      legacy: 'reject',
+      onerror: (error) => {
+        logger.error('[MCP 2026] Modern handler error:', error);
+      },
+    },
+  );
+  modernMcpNodeHandler = toNodeHandler(modernMcpHandler, {
+    onerror: (error) => {
+      logger.error('[MCP 2026] Node adapter error:', error);
+    },
+  });
+
+  return modernMcpNodeHandler;
+};
+
+export const closeModernMcpHandler = async (): Promise<void> => {
+  if (modernMcpHandler) {
+    await modernMcpHandler.close();
+  }
+  modernMcpHandler = undefined;
+  modernMcpNodeHandler = undefined;
+};
 
 export const getGroup = (sessionId: string): string => {
   return transports[sessionId]?.group || '';
@@ -103,7 +151,7 @@ const sendSessionNotFoundText = (res: Response): void => {
 };
 
 const rehydrateRebuiltTransport = (
-  transport: StreamableHTTPServerTransport,
+  transport: NodeStreamableHTTPServerTransport,
   sessionId: string,
 ): boolean => {
   const transportRecord = transport as unknown as Record<string, unknown>;
@@ -392,6 +440,25 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
     }
   }
 
+  // Forward auth runs before keys and OAuth tokens: a JWT from the configured
+  // issuer either authenticates here or is rejected, with no fallback.
+  const forwardAuthResult = await authenticateForwardAuthToken(presentedToken, systemConfig);
+  if (forwardAuthResult.status === 'rejected') {
+    return { valid: false, reason: 'invalid' };
+  }
+  if (forwardAuthResult.status === 'authenticated') {
+    const requestedUsername = req.params.user;
+    if (requestedUsername && requestedUsername !== forwardAuthResult.user.username) {
+      return { valid: false, reason: 'forbidden' };
+    }
+    logger.log('Authenticated request using forward-auth JWT');
+    return {
+      valid: true,
+      user: forwardAuthResult.user,
+      keyName: FORWARD_AUTH_METHOD_LABEL,
+    };
+  }
+
   if (!enableBearerAuth) {
     if (!hasBearerHeader) {
       return { valid: true };
@@ -484,8 +551,12 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
 };
 
 // Recheck every request, including existing sessions and smart group routes.
-const authorizeGroupRoute = async (req: Request, res: Response): Promise<boolean> => {
-  const sessionId = getRequestSessionId(req);
+const authorizeGroupRoute = async (
+  req: Request,
+  res: Response,
+  legacySession = true,
+): Promise<boolean> => {
+  const sessionId = legacySession ? getRequestSessionId(req) : undefined;
   const session = sessionId ? transports[sessionId] : undefined;
   if (session && !(await groupRouteReferencesMatch(req.params.group, session.group))) {
     res.status(403).json({ error: 'forbidden', error_description: 'Session route mismatch' });
@@ -764,7 +835,7 @@ async function createSessionWithId(
   group: string,
   username?: string,
   hostedAuth?: HostedAuthContext,
-): Promise<StreamableHTTPServerTransport> {
+): Promise<NodeStreamableHTTPServerTransport> {
   logger.log(
     `[SESSION REBUILD] Starting session rebuild for ID: ${sessionId}${username ? ` for user: ${username}` : ''}`,
   );
@@ -772,7 +843,7 @@ async function createSessionWithId(
   // Create a new server instance to ensure clean state
   const server = await getMcpServer(sessionId, group);
 
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new NodeStreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId, // Use the specified sessionId
     onsessioninitialized: (initializedSessionId) => {
       logger.log(
@@ -818,13 +889,13 @@ async function createNewSession(
   group: string,
   username?: string,
   hostedAuth?: HostedAuthContext,
-): Promise<StreamableHTTPServerTransport> {
+): Promise<NodeStreamableHTTPServerTransport> {
   const newSessionId = randomUUID();
   logger.log(
     `[SESSION NEW] Creating new session with ID: ${newSessionId}${username ? ` for user: ${username}` : ''}`,
   );
 
-  const transport = new StreamableHTTPServerTransport({
+  const transport = new NodeStreamableHTTPServerTransport({
     sessionIdGenerator: () => newSessionId,
     onsessioninitialized: (sessionId) => {
       transports[sessionId] = { transport, group, hostedAuth };
@@ -850,9 +921,14 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
   // User context is now set by sseUserContextMiddleware
   const userContextService = UserContextService.getInstance();
 
-  // Streamable HTTP clients may continue an existing session on the global route.
-  // Reuse the session's group before bearer-scope validation in that case.
-  attachSessionGroupToRequest(req);
+  // Classify before restoring legacy session scope. Modern routing and auth must
+  // depend on the request URL, not on an unrelated legacy session ID.
+  const webRequest = await toWebRequest(req, req.body);
+  const legacyRequest = await isLegacyRequest(webRequest, req.body);
+  if (legacyRequest) {
+    // Legacy clients may continue a group session through the global route.
+    attachSessionGroupToRequest(req);
+  }
 
   // Check bearer auth using filtered settings
   const bearerAuthResult = await validateBearerAuth(req);
@@ -862,7 +938,7 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
   }
 
   attachUserContextFromBearer(bearerAuthResult, res);
-  if (!(await authorizeGroupRoute(req, res))) return;
+  if (!(await authorizeGroupRoute(req, res, legacyRequest))) return;
 
   const currentUser = userContextService.getCurrentUser();
   const username = currentUser?.username;
@@ -886,7 +962,42 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
     return;
   }
 
-  let transport: StreamableHTTPServerTransport;
+  // MCP 2026-07-28 is stateless over HTTP. Keep the existing sessionful
+  // Streamable HTTP path for 2025-era clients, and let the SDK's own
+  // classifier route modern (or malformed-modern) traffic to createMcpHandler.
+  if (!legacyRequest) {
+    logger.log(
+      `[MCP 2026] Handling stateless request in group: ${group || 'global'}${username ? ` for user: ${username}` : ''}`,
+    );
+
+    const requestContextService = RequestContextService.getInstance();
+    await requestContextService.runWithRequestContext(req, async () => {
+      requestContextService.setBearerKeyContext(bearerAuthResult.keyId, bearerAuthResult.keyName);
+      requestContextService.setGroupContext(group);
+      requestContextService.setUsernameContext(username);
+      requestContextService.setKeyKindContext(bearerAuthResult.kind);
+      requestContextService.setHostedAuthContext(bearerAuthResult.hostedAuth);
+
+      const context = requestContextService.getRequestContext()!;
+      context.stateless = true;
+      context.sessionId = undefined;
+      const requestMeta = (Array.isArray(req.body) ? req.body[0] : req.body)?.params?._meta;
+      context.clientCapabilities = requestMeta?.['io.modelcontextprotocol/clientCapabilities'];
+      // Bind application state to the authenticated credential, user and route.
+      // Never treat caller-provided correlation metadata as identity.
+      const token = getBearerTokenFromHeaders(req.headers, systemConfig);
+      if (token && (systemConfig?.routing?.enableBearerAuth ?? true)) {
+        context.clientStateScope = createHash('sha256')
+          .update(JSON.stringify([token, username || '', group || '']))
+          .digest('hex');
+      }
+
+      await getModernMcpNodeHandler()(req, res, req.body);
+    });
+    return;
+  }
+
+  let transport: NodeStreamableHTTPServerTransport;
   let transportInfo: (typeof transports)[string] | undefined;
 
   if (sessionId) {
@@ -898,7 +1009,7 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
     logger.log(
       `[SESSION REUSE] Reusing existing session: ${sessionId}${username ? ` for user: ${username}` : ''}`,
     );
-    transport = transportInfo.transport as StreamableHTTPServerTransport;
+    transport = transportInfo.transport as NodeStreamableHTTPServerTransport;
   } else if (sessionId) {
     // Case 2: SessionId exists but transport is missing (server restart), check if session rebuild is enabled
     const enableSessionRebuild = systemConfig?.enableSessionRebuild || false;
@@ -1111,7 +1222,7 @@ export const handleMcpOtherRequest = async (req: Request, res: Response) => {
   const { transport } = transportEntry;
 
   try {
-    await (transport as StreamableHTTPServerTransport).handleRequest(req, res);
+    await (transport as NodeStreamableHTTPServerTransport).handleRequest(req, res);
   } catch (error: any) {
     if (error?.message?.includes('Server not initialized')) {
       logger.warn(

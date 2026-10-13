@@ -1,7 +1,14 @@
-import { expandEnvVars, loadSettings } from '../config/index.js';
+import { loadSettings } from '../config/index.js';
 import { getSystemConfigDao } from '../dao/DaoFactory.js';
 import { BetterAuthConfig, BetterAuthOidcProviderConfig, SystemConfig } from '../types/index.js';
 import { resolveInstallBaseUrl } from '../utils/installBaseUrl.js';
+import {
+  normalizeOptionalString,
+  normalizeStringArray,
+  resolveBooleanSetting,
+  resolveStringArraySetting,
+  resolveStringSetting,
+} from '../utils/settingResolvers.js';
 import { getCachedSystemConfig, isDatabaseModeEnabled } from '../utils/systemConfigCache.js';
 
 const DEFAULT_BETTER_AUTH_BASE_PATH = '/api/auth/better';
@@ -17,11 +24,28 @@ const VALID_OIDC_PROMPTS = new Set<string>([
   'login consent',
 ]);
 
+export type SsoProviderName = 'google' | 'github' | 'oidc';
+
+// SSO providers whose Better Auth handler this process mounted at startup.
+// Providers are registered once, when `src/betterAuth.ts` loads, so one enabled
+// later in Settings has no working sign-in route until a restart.
+let mountedSsoProviders: ReadonlySet<SsoProviderName> = new Set();
+
+export const setMountedSsoProviders = (providers: Iterable<SsoProviderName>): void => {
+  mountedSsoProviders = new Set(providers);
+};
+
 export interface BetterAuthRuntimeConfig {
   enabled: boolean;
   basePath: string;
   trustedOrigins: string[];
   disableAutoCreate: boolean;
+  /**
+   * Username/password login is refused. Only ever true while an SSO provider is
+   * enabled and its sign-in route is mounted, so the switch cannot leave a
+   * deployment without any way to log in.
+   */
+  disablePasswordLogin: boolean;
   providers: {
     google: {
       enabled: boolean;
@@ -40,40 +64,6 @@ export interface BetterAuthRuntimeConfig {
     };
   };
 }
-
-const parseBoolean = (value: unknown): boolean | undefined => {
-  if (typeof value === 'boolean') {
-    return value;
-  }
-
-  if (typeof value !== 'string') {
-    return undefined;
-  }
-
-  const normalizedValue = value.trim().toLowerCase();
-  if (!normalizedValue) {
-    return undefined;
-  }
-
-  if (['true', '1', 'yes', 'on'].includes(normalizedValue)) {
-    return true;
-  }
-
-  if (['false', '0', 'no', 'off'].includes(normalizedValue)) {
-    return false;
-  }
-
-  return undefined;
-};
-
-const normalizeOptionalString = (value: unknown): string | undefined => {
-  if (typeof value !== 'string') {
-    return undefined;
-  }
-
-  const trimmedValue = expandEnvVars(value).trim();
-  return trimmedValue || undefined;
-};
 
 const normalizePath = (value: unknown): string => {
   const normalizedValue = normalizeOptionalString(value);
@@ -96,44 +86,6 @@ const normalizeTrustedOrigin = (value: unknown): string | null => {
   }
 };
 
-const splitStringArray = (value: string): string[] => {
-  const normalizedValue = expandEnvVars(value).trim();
-  if (!normalizedValue) {
-    return [];
-  }
-
-  if (normalizedValue.startsWith('[')) {
-    try {
-      const parsedValue = JSON.parse(normalizedValue);
-      if (Array.isArray(parsedValue)) {
-        return parsedValue
-          .map((item) => normalizeOptionalString(item))
-          .filter((item): item is string => Boolean(item));
-      }
-    } catch {
-      // Fall back to delimiter-based parsing below.
-    }
-  }
-
-  const delimiter = normalizedValue.includes(',') ? /,/ : /\s+/;
-  return normalizedValue
-    .split(delimiter)
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-};
-
-const normalizeStringArray = (value: unknown, fallback: string[] = []): string[] => {
-  const normalized = Array.isArray(value)
-    ? value
-        .map((item) => normalizeOptionalString(item))
-        .filter((item): item is string => Boolean(item))
-    : typeof value === 'string'
-      ? splitStringArray(value)
-      : [];
-
-  return normalized.length > 0 ? normalized : fallback;
-};
-
 const normalizePrompt = (value: unknown): BetterAuthOidcProviderConfig['prompt'] | undefined => {
   const normalizedValue = normalizeOptionalString(value);
   if (!normalizedValue || !VALID_OIDC_PROMPTS.has(normalizedValue)) {
@@ -147,62 +99,6 @@ export const resolveBetterAuthBaseUrl = (systemConfig?: SystemConfig | null): st
   normalizeOptionalString(process.env.BETTER_AUTH_URL) ||
   normalizeOptionalString(systemConfig?.auth?.betterAuth?.baseUrl) ||
   resolveInstallBaseUrl(systemConfig);
-
-const resolveBooleanSetting = (
-  envValue: string | undefined,
-  settingsValue: unknown,
-  defaultValue: boolean,
-): boolean => {
-  const envOverride = parseBoolean(envValue);
-  if (envOverride !== undefined) {
-    return envOverride;
-  }
-
-  const settingsOverride = parseBoolean(settingsValue);
-  if (settingsOverride !== undefined) {
-    return settingsOverride;
-  }
-
-  return defaultValue;
-};
-
-const resolveStringSetting = (
-  envValue: string | undefined,
-  settingsValue: unknown,
-  defaultValue?: string,
-): string | undefined => {
-  const envOverride = normalizeOptionalString(envValue);
-  if (envOverride !== undefined) {
-    return envOverride;
-  }
-
-  const settingsOverride = normalizeOptionalString(settingsValue);
-  if (settingsOverride !== undefined) {
-    return settingsOverride;
-  }
-
-  return defaultValue;
-};
-
-const resolveStringArraySetting = (
-  envValue: string | undefined,
-  settingsValue: unknown,
-  defaultValue: string[] = [],
-): string[] => {
-  if (envValue !== undefined) {
-    const envOverride = normalizeStringArray(envValue, []);
-    if (envOverride.length > 0) {
-      return envOverride;
-    }
-  }
-
-  const settingsOverride = normalizeStringArray(settingsValue, []);
-  if (settingsOverride.length > 0) {
-    return settingsOverride;
-  }
-
-  return defaultValue;
-};
 
 const resolvePromptSetting = (
   envValue: string | undefined,
@@ -313,11 +209,29 @@ export const resolveBetterAuthRuntimeConfig = (
     false,
   );
 
+  // Counts only a provider that is enabled now and was mounted at startup: one
+  // enabled in Settings since then shows a sign-in button with no route behind it
+  const ssoSignInAvailable =
+    (googleEnabled && mountedSsoProviders.has('google')) ||
+    (githubEnabled && mountedSsoProviders.has('github')) ||
+    (oidcEnabled && mountedSsoProviders.has('oidc'));
+
+  // The env var wins in both directions, so it is also the recovery switch when
+  // the identity provider is unavailable
+  const disablePasswordLogin =
+    ssoSignInAvailable &&
+    resolveBooleanSetting(
+      process.env.BETTER_AUTH_DISABLE_PASSWORD_LOGIN,
+      betterAuthSettings.disablePasswordLogin,
+      false,
+    );
+
   return {
     enabled: anyProviderEnabled,
     basePath,
     trustedOrigins,
     disableAutoCreate,
+    disablePasswordLogin,
     providers: {
       google: {
         enabled: googleEnabled,
@@ -347,6 +261,31 @@ export const getBetterAuthRuntimeConfig = async (
 
   const systemConfig = await getSystemConfigDao().get();
   return resolveBetterAuthRuntimeConfig(systemConfig);
+};
+
+/**
+ * True when a request path under the `/api` mount should bypass the shared
+ * authentication gate and its rate limiter. This is the single source of truth
+ * for the exemption applied in `src/middlewares/index.ts` and mirrored by the
+ * `apiAuthGateRateLimiter` skip in `src/utils/rateLimit.ts`: public auth routes
+ * (login, register) and better-auth endpoints carry their own limiters or
+ * handler, so they must not consume the shared authenticated-route budget.
+ *
+ * `reqPath` is the path relative to the `/api` mount (Express strips the mount
+ * prefix), e.g. `/auth/login` for a request to `/api/auth/login`.
+ */
+export const isApiAuthExemptPath = (
+  reqPath: string,
+  betterAuthConfig: Pick<BetterAuthRuntimeConfig, 'basePath'>,
+): boolean => {
+  const betterAuthApiPath = betterAuthConfig.basePath.startsWith('/api')
+    ? betterAuthConfig.basePath.replace(/^\/api/, '') || '/'
+    : null;
+  return (
+    reqPath === '/auth/login' ||
+    (betterAuthApiPath !== null && reqPath.startsWith(betterAuthApiPath)) ||
+    reqPath.startsWith('/better-auth')
+  );
 };
 
 export const betterAuthRuntimeConfig = (() => {

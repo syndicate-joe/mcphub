@@ -13,9 +13,14 @@ import {
 } from './groupService.js';
 import { searchToolsByVector } from './vectorSearchService.js';
 import { getSmartRoutingConfig, type SmartRoutingConfig } from '../utils/smartRouting.js';
+import {
+  DEFAULT_TOOL_DEFINITION_FIELDS,
+  type ToolDefinitionField,
+} from '../constants/smartRoutingDefaults.js';
 import { getServerDao } from '../dao/index.js';
-import { getGroup } from './sseService.js';
+import { getMcpRequestGroup } from '../utils/mcpRequestGroup.js';
 import { isAppOnlyTool } from '../utils/mcpApps.js';
+import { canServeToolRequests } from '../utils/serverAvailability.js';
 import { getNameSeparator } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 
@@ -68,6 +73,27 @@ const cleanInputSchema = (schema: any): any => {
 
   return cleanedSchema;
 };
+
+/**
+ * The tool as a model sees it in search_tools and describe_tool results: name,
+ * description, the cleaned inputSchema and serverName, plus the optional fields
+ * the smartRouting.toolDefinitionFields setting selects. Not a spread of the
+ * cached tool, which also carries client-facing data such as base64 icons.
+ */
+const buildModelFacingTool = (
+  tool: Tool,
+  description: string,
+  serverName: string,
+  fields: readonly ToolDefinitionField[],
+) => ({
+  name: tool.name,
+  description,
+  inputSchema: cleanInputSchema(tool.inputSchema),
+  ...Object.fromEntries(
+    fields.filter((field) => tool[field] !== undefined).map((field) => [field, tool[field]]),
+  ),
+  serverName,
+});
 
 const getSmartTargetGroup = (group: string | undefined): string | undefined => {
   return group?.startsWith('$smart/') ? group.substring(7) || undefined : undefined;
@@ -140,14 +166,42 @@ const projectToolForGroup = (tool: any, serverConfigsByName: Map<string, IGroupS
   };
 };
 
+const describeToolInputSchema = {
+  type: 'object',
+  properties: {
+    toolName: {
+      type: 'string',
+      description: 'The exact name of the tool to describe (from search_tools results)',
+    },
+  },
+  required: ['toolName'],
+};
+
+/** Sentence telling the model which search_tools hits come without an inputSchema. */
+const describeFullSchemaTopN = (fullSchemaTopN: number): string => {
+  if (fullSchemaTopN === 0) {
+    return 'Results do not include the inputSchema; use describe_tool to get it before calling a tool.';
+  }
+  const top =
+    fullSchemaTopN === 1
+      ? 'Only the first result includes'
+      : `Only the first ${fullSchemaTopN} results include`;
+  return `${top} the full inputSchema; use describe_tool to get it for any other result before calling it.`;
+};
+
 /**
  * Build meta-tool definitions for a given scope.
  * Pure function — no I/O, no config reads.
+ *
+ * `fullSchemaTopN` only applies to the standard mode: when set, search_tools
+ * says which hits come without a schema and describe_tool is listed so the
+ * model can fetch it. Unset keeps the standard mode's two tools as they were.
  */
 export const buildSmartRoutingMetaTools = (
   scopeDescription: string,
   serversList: string,
   progressiveDisclosure: boolean,
+  fullSchemaTopN?: number,
 ): any[] => {
   const tools: any[] = [];
 
@@ -190,16 +244,7 @@ Available servers: ${serversList}`,
         name: 'describe_tool',
         description:
           'STEP 2 of 3: Use this tool AFTER search_tools to get the full parameter schema for a specific tool. This provides the complete inputSchema needed to correctly invoke the tool with call_tool.\n\nWorkflow: search_tools → describe_tool → call_tool',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            toolName: {
-              type: 'string',
-              description: 'The exact name of the tool to describe (from search_tools results)',
-            },
-          },
-          required: ['toolName'],
-        },
+        inputSchema: describeToolInputSchema,
         annotations: {
           title: 'Describe Tool',
           readOnlyHint: true,
@@ -232,7 +277,9 @@ Available servers: ${serversList}`,
       },
     );
   } else {
-    // Standard mode: search_tools returns full schema
+    // Standard mode: search_tools returns full schema (for the top N hits if limited)
+    const schemaNote =
+      fullSchemaTopN === undefined ? '' : `\n\n${describeFullSchemaTopN(fullSchemaTopN)}`;
     tools.push(
       {
         name: 'search_tools',
@@ -240,7 +287,7 @@ Available servers: ${serversList}`,
 
 For optimal results, use specific queries matching your exact needs. Call this tool multiple times with different queries for different parts of complex tasks. Example queries: "image generation tools", "code review tools", "data analysis", "translation capabilities", etc. Results are sorted by relevance using vector similarity.
 
-After finding relevant tools, you MUST use the call_tool to actually execute them. The search_tools only finds tools - it doesn't execute them.
+After finding relevant tools, you MUST use the call_tool to actually execute them. The search_tools only finds tools - it doesn't execute them.${schemaNote}
 
 Available servers: ${serversList}`,
         inputSchema: {
@@ -265,6 +312,20 @@ Available servers: ${serversList}`,
           readOnlyHint: true,
         },
       },
+      ...(fullSchemaTopN === undefined
+        ? []
+        : [
+            {
+              name: 'describe_tool',
+              description:
+                'Use this tool to get the full parameter schema of a search_tools result that was returned without an inputSchema, before invoking it with call_tool.',
+              inputSchema: describeToolInputSchema,
+              annotations: {
+                title: 'Describe Tool',
+                readOnlyHint: true,
+              },
+            },
+          ]),
       {
         name: 'call_tool',
         description:
@@ -299,6 +360,23 @@ Available servers: ${serversList}`,
 /**
  * Compute the scope (server list + scope description) for a smart routing group.
  */
+/**
+ * The servers Smart Routing covers for a request: visible to the caller, able
+ * to serve a tool call (connected, or idle and started on demand, which
+ * call_tool wakes), and in the target group when there is one. The
+ * search_tools description, the search itself, its no-match message and
+ * describe_tool all use this one set, so they cannot disagree about what is
+ * available.
+ */
+const getAvailableServers = async (targetGroup: string | undefined): Promise<ServerInfo[]> => {
+  const servers = getServerInfos().filter(canServeToolRequests);
+  if (!targetGroup) {
+    return servers;
+  }
+  const serversInGroup = new Set(await getServersInGroup(targetGroup));
+  return servers.filter((server) => serversInGroup.has(server.name));
+};
+
 const computeSmartRoutingScope = async (
   group: string | undefined,
   smartRoutingConfig: SmartRoutingConfig,
@@ -309,18 +387,7 @@ const computeSmartRoutingScope = async (
   const targetGroup = getSmartTargetGroup(group);
   const serverConfigsByName = await getGroupServerConfigMap(targetGroup);
 
-  // Get info about available servers, filtered by target group if specified
-  let availableServers = getServerInfos().filter(
-    (server) => server.status === 'connected' && server.enabled !== false,
-  );
-
-  // If a target group is specified, filter servers to only those in the group
-  if (targetGroup) {
-    const serversInGroup = await getServersInGroup(targetGroup);
-    if (serversInGroup && serversInGroup.length > 0) {
-      availableServers = availableServers.filter((server) => serversInGroup.includes(server.name));
-    }
-  }
+  const availableServers = await getAvailableServers(targetGroup);
 
   // Create simple server information with only server names or include descriptions when configured
   const serversList =
@@ -360,7 +427,12 @@ export const getSmartRoutingMetaToolDefinitions = async (
     group,
     smartRoutingConfig,
   );
-  return buildSmartRoutingMetaTools(scopeDescription, serversList, progressiveDisclosure);
+  return buildSmartRoutingMetaTools(
+    scopeDescription,
+    serversList,
+    progressiveDisclosure,
+    smartRoutingConfig.fullSchemaTopN,
+  );
 };
 
 /**
@@ -379,9 +451,31 @@ export const getSmartRoutingTools = async (
   );
 
   return {
-    tools: buildSmartRoutingMetaTools(scopeDescription, serversList, progressiveDisclosure),
+    tools: buildSmartRoutingMetaTools(
+      scopeDescription,
+      serversList,
+      progressiveDisclosure,
+      smartRoutingConfig.fullSchemaTopN,
+    ),
   };
 };
+
+/**
+ * Default similarity threshold when none is configured: lower for short, general
+ * queries (more diverse results), higher for long or explicitly precise ones.
+ */
+export const getHeuristicSimilarityThreshold = (query: string): number => {
+  if (query.length > 30 || query.includes('specific') || query.includes('exact')) {
+    return 0.4;
+  }
+  if (query.length < 10 || query.split(' ').length <= 2) {
+    return 0.2;
+  }
+  return 0.3;
+};
+
+/** Similarity rounded to two decimals, as reported to the model. */
+const roundScore = (similarity: number): number => Math.round(similarity * 100) / 100;
 
 /**
  * Handle the search_tools request for smart routing
@@ -390,6 +484,7 @@ export const handleSearchToolsRequest = async (
   query: string,
   limit: number,
   sessionId: string,
+  requestGroup?: string,
 ): Promise<any> => {
   if (!query || typeof query !== 'string') {
     throw new Error('Query parameter is required and must be a string');
@@ -397,63 +492,43 @@ export const handleSearchToolsRequest = async (
 
   const limitNum = Math.min(Math.max(parseInt(String(limit)) || 10, 1), 100);
 
-  // Dynamically adjust threshold based on query characteristics
-  let thresholdNum = 0.3; // Default threshold
-
-  // For more general queries, use a lower threshold to get more diverse results
-  if (query.length < 10 || query.split(' ').length <= 2) {
-    thresholdNum = 0.2;
-  }
-
-  // For very specific queries, use a higher threshold for more precise results
-  if (query.length > 30 || query.includes('specific') || query.includes('exact')) {
-    thresholdNum = 0.4;
-  }
+  const smartRoutingConfig = await getSmartRoutingConfig();
+  const progressiveDisclosure = smartRoutingConfig.progressiveDisclosure ?? false;
+  const fullSchemaTopN = progressiveDisclosure ? undefined : smartRoutingConfig.fullSchemaTopN;
+  const toolDefinitionFields =
+    smartRoutingConfig.toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS;
+  const thresholdNum =
+    smartRoutingConfig.similarityThreshold ?? getHeuristicSimilarityThreshold(query);
 
   logger.log(`Using similarity threshold: ${thresholdNum} for query: "${query}"`);
 
-  // Determine server filtering based on group
-  let group = getGroup(sessionId);
-  const visibleServerNames = new Set(getServerInfos().map((serverInfo) => serverInfo.name));
-  let servers: string[] = Array.from(visibleServerNames);
-  let serverConfigsByName = new Map<string, IGroupServerConfig>();
-
-  // If group is in format $smart/{group}, filter servers to that group
+  // Determine server filtering based on group ($smart/{group})
+  let group = getMcpRequestGroup({ sessionId, group: requestGroup });
   const targetGroup = getSmartTargetGroup(group);
   if (targetGroup) {
-    if (targetGroup) {
-      group = targetGroup;
-    }
-    serverConfigsByName = await getGroupServerConfigMap(targetGroup);
-    const serversInGroup = await getServersInGroup(targetGroup);
-    if (serversInGroup !== undefined && serversInGroup !== null) {
-      servers = serversInGroup.filter((serverName) => visibleServerNames.has(serverName));
-      if (servers && servers.length > 0) {
-        logger.log(`Filtering search to servers in group "${targetGroup}": ${servers.join(', ')}`);
-      } else {
-        logger.log(`Group "${targetGroup}" has no servers, search will return no results`);
-      }
-    }
+    group = targetGroup;
+  }
+  const serverConfigsByName = await getGroupServerConfigMap(targetGroup);
+  const availableServers = await getAvailableServers(targetGroup);
+  const servers = availableServers.map((server) => server.name);
+  if (targetGroup) {
+    logger.log(
+      servers.length > 0
+        ? `Filtering search to servers in group "${targetGroup}": ${servers.join(', ')}`
+        : `Group "${targetGroup}" has no servers, search will return no results`,
+    );
   }
 
   const searchResults =
     servers.length > 0 ? await searchToolsByVector(query, limitNum, thresholdNum, servers) : [];
   logger.log(`Search results: ${JSON.stringify(searchResults)}`);
 
-  // Get smart routing config to check progressive disclosure setting
-  const smartRoutingConfig = await getSmartRoutingConfig();
-  const progressiveDisclosure = smartRoutingConfig.progressiveDisclosure ?? false;
-
   // Find actual tool information from serverInfos by serverName and toolName
   const resolvedTools = await Promise.all(
     searchResults.map(async (result) => {
-      // Find the server in serverInfos
-      const server = getServerInfos().find(
-        (serverInfo) =>
-          serverInfo.name === result.serverName &&
-          serverInfo.status === 'connected' &&
-          serverInfo.enabled !== false,
-      );
+      // An idle server still has its cached tools; without them the hit
+      // falls back to the stored embedding below
+      const server = availableServers.find((serverInfo) => serverInfo.name === result.serverName);
       if (server && server.tools && server.tools.length > 0) {
         // Find the tool in server.tools
         const actualTool = server.tools.find((tool) => tool.name === result.toolName);
@@ -478,12 +553,13 @@ export const handleSearchToolsRequest = async (
                 serverName: result.serverName,
               };
             } else {
-              // Standard mode: return full tool info
-              return {
-                ...actualTool,
-                description: toolConfig?.description || actualTool.description,
-                serverName: result.serverName,
-              };
+              // Standard mode: return the full definition
+              return buildModelFacingTool(
+                actualTool,
+                toolConfig?.description || actualTool.description,
+                result.serverName,
+                toolDefinitionFields,
+              );
             }
           }
         }
@@ -506,7 +582,13 @@ export const handleSearchToolsRequest = async (
       }
     }),
   );
-  const modelVisibleTools = resolvedTools.filter((tool) => tool !== null);
+  // `score` is the raw query-to-tool similarity, the value compared with the
+  // threshold; the order also weighs how well the tool's server matches.
+  const scoredTools = resolvedTools.map((tool, index) => {
+    const result = searchResults[index];
+    return tool && { ...tool, score: roundScore(result.toolSimilarity ?? result.similarity) };
+  });
+  const modelVisibleTools = scoredTools.filter((tool) => tool !== null);
 
   // Filter the resolved tools
   const filterResults = await Promise.all(
@@ -528,30 +610,50 @@ export const handleSearchToolsRequest = async (
   );
   const tools = modelVisibleTools
     .filter((_, i) => filterResults[i])
-    .map((tool) => projectToolForGroup(tool, serverConfigsByName));
+    .map((tool) => projectToolForGroup(tool, serverConfigsByName))
+    // Past the first fullSchemaTopN hits, keep only what is needed to pick a tool
+    .map((tool, index) =>
+      fullSchemaTopN === undefined || index < fullSchemaTopN
+        ? tool
+        : {
+            name: tool.name,
+            description: tool.description,
+            serverName: tool.serverName,
+            score: tool.score,
+          },
+    );
 
   // Build response based on mode
   let guideline: string;
   let nextSteps: string;
 
-  if (progressiveDisclosure) {
+  if (tools.length === 0) {
+    // Say what was searched, so the model can conclude the capability is not
+    // here instead of retrying the same search with other words
+    const searchedServers = servers.map((serverName) =>
+      getExposedServerName(serverName, serverConfigsByName.get(serverName)),
+    );
     guideline =
-      tools.length > 0
-        ? "Found relevant tools. Use describe_tool to get the full parameter schema before calling. If these tools don't match exactly what you need, try another search with more specific keywords."
-        : 'No tools found. Try broadening your search or using different keywords.';
+      searchedServers.length > 0
+        ? `No tool matched the query with a similarity of at least ${thresholdNum}. Searched servers: ${searchedServers.join(', ')}. If none of them covers the task, it is not available here.`
+        : 'No tools found: no connected server is available to search.';
     nextSteps =
-      tools.length > 0
-        ? 'Use describe_tool with the toolName to get the full inputSchema, then use call_tool to execute.'
-        : 'Consider searching for related capabilities or more general terms.';
+      searchedServers.length > 0
+        ? 'Try different keywords for the same task, or tell the user that no available tool covers it.'
+        : 'Tell the user that no tools are currently available.';
+  } else if (progressiveDisclosure) {
+    guideline =
+      "Found tools, most relevant first; score is the query-to-tool similarity (0-1). Use describe_tool to get the full parameter schema before calling. If these tools don't match exactly what you need, try another search with more specific keywords.";
+    nextSteps =
+      'Use describe_tool with the toolName to get the full inputSchema, then use call_tool to execute.';
   } else {
-    guideline =
-      tools.length > 0
-        ? "Found relevant tools. If these tools don't match exactly what you need, try another search with more specific keywords."
-        : 'No tools found. Try broadening your search or using different keywords.';
-    nextSteps =
-      tools.length > 0
-        ? 'To use a tool, call call_tool with the toolName and required arguments.'
-        : 'Consider searching for related capabilities or more general terms.';
+    const trimmedSchemas = fullSchemaTopN !== undefined && tools.length > fullSchemaTopN;
+    guideline = `Found tools, most relevant first; score is the query-to-tool similarity (0-1).${
+      trimmedSchemas ? ` ${describeFullSchemaTopN(fullSchemaTopN)}` : ''
+    } If these tools don't match exactly what you need, try another search with more specific keywords.`;
+    nextSteps = trimmedSchemas
+      ? 'To use a tool, call call_tool with the toolName and required arguments; call describe_tool first for a result without an inputSchema.'
+      : 'To use a tool, call call_tool with the toolName and required arguments.';
   }
 
   const response = {
@@ -582,6 +684,7 @@ export const handleSearchToolsRequest = async (
 export const handleDescribeToolRequest = async (
   toolName: string,
   sessionId: string,
+  requestGroup?: string,
 ): Promise<any> => {
   if (!toolName || typeof toolName !== 'string') {
     throw new Error('toolName parameter is required and must be a string');
@@ -590,19 +693,15 @@ export const handleDescribeToolRequest = async (
   logger.log(`Handling describe_tool request for: ${toolName}`);
 
   // Determine group filtering
-  let group = getGroup(sessionId);
+  let group = getMcpRequestGroup({ sessionId, group: requestGroup });
   const targetGroup = getSmartTargetGroup(group);
   const serverConfigsByName = await getGroupServerConfigMap(targetGroup);
   if (targetGroup) {
     group = targetGroup;
   }
 
-  // Find the tool across all connected servers
-  for (const serverInfo of getServerInfos()) {
-    if (serverInfo.status !== 'connected' || serverInfo.enabled === false) {
-      continue;
-    }
-
+  // Find the tool across the available servers, an idle one included: call_tool wakes it
+  for (const serverInfo of await getAvailableServers(targetGroup)) {
     const resolvedToolName = resolveNameFromGroup(toolName, serverInfo.name, serverConfigsByName);
 
     // Check if this server has the tool
@@ -629,12 +728,16 @@ export const handleDescribeToolRequest = async (
     const serverConfig = await getServerDao().findById(serverInfo.name);
     const toolConfig = serverConfig?.tools?.[tool.name];
 
-    // Return full tool information
+    // Return the full definition, with the same fields as a search_tools hit
+    const { toolDefinitionFields } = await getSmartRoutingConfig();
     const toolInfo = {
+      ...buildModelFacingTool(
+        tool,
+        toolConfig?.description || tool.description,
+        getExposedServerName(serverInfo.name, serverConfigsByName.get(serverInfo.name)),
+        toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS,
+      ),
       name: projectNameForGroup(tool.name, serverInfo.name, serverConfigsByName),
-      description: toolConfig?.description || tool.description,
-      inputSchema: cleanInputSchema(tool.inputSchema),
-      serverName: getExposedServerName(serverInfo.name, serverConfigsByName.get(serverInfo.name)),
     };
 
     return {

@@ -47,6 +47,12 @@ interface SmartRoutingConfig {
   azureOpenaiEmbeddingModel?: string;
   progressiveDisclosure: boolean;
   embeddingMaxTokens?: number;
+  embeddingQueryPrefix?: string;
+  embeddingDocumentPrefix?: string;
+  similarityThreshold?: number;
+  fullSchemaTopN?: number;
+  // Unset = server default (title, annotations)
+  toolDefinitionFields?: string[];
   /**
    * Read-only metadata from the server (issue #642): fields whose runtime value
    * comes from an environment variable, so whatever is typed into the form for
@@ -105,6 +111,7 @@ interface BetterAuthConfig {
   baseUrl: string;
   basePath: string;
   trustedOrigins: string[];
+  disablePasswordLogin: boolean;
   providers: {
     google: BetterAuthProviderToggle;
     github: BetterAuthProviderToggle;
@@ -125,6 +132,7 @@ interface SystemSettings {
       betterAuth?: Partial<BetterAuthConfig>;
     };
     enableSessionRebuild?: boolean;
+    network?: { allowedCidrs?: string[] };
     activityLog?: {
       storeToolPayload?: boolean;
     };
@@ -150,6 +158,8 @@ interface SettingsContextValue {
   betterAuthConfig: BetterAuthConfig;
   nameSeparator: string;
   enableSessionRebuild: boolean;
+  allowedCidrs: string[];
+  updateAllowedCidrs: (value: string[]) => Promise<boolean>;
   storeToolPayload: boolean;
   bearerKeys: BearerKey[];
   loading: boolean;
@@ -225,6 +235,7 @@ const getDefaultBetterAuthConfig = (): BetterAuthConfig => ({
   baseUrl: '',
   basePath: '/api/auth/better',
   trustedOrigins: [],
+  disablePasswordLogin: false,
   providers: {
     google: {
       enabled: true,
@@ -264,6 +275,7 @@ const normalizeBetterAuthConfig = (
     baseUrl: config?.baseUrl?.trim() || defaults.baseUrl,
     basePath: config?.basePath?.trim() || defaults.basePath,
     trustedOrigins: normalizeStringArray(config?.trustedOrigins, defaults.trustedOrigins),
+    disablePasswordLogin: config?.disablePasswordLogin ?? defaults.disablePasswordLogin,
     providers: {
       google: {
         enabled: config?.providers?.google?.enabled ?? defaults.providers.google.enabled,
@@ -373,6 +385,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
     azureOpenaiEmbeddingModel: '',
     progressiveDisclosure: false,
     embeddingMaxTokens: undefined,
+    embeddingQueryPrefix: '',
+    embeddingDocumentPrefix: '',
+    similarityThreshold: undefined,
+    fullSchemaTopN: undefined,
   });
 
   const [toolResultCompressionConfig, setToolResultCompressionConfig] =
@@ -399,6 +415,7 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
 
   const [nameSeparator, setNameSeparator] = useState<string>('-');
   const [enableSessionRebuild, setEnableSessionRebuild] = useState<boolean>(false);
+  const [allowedCidrs, setAllowedCidrs] = useState<string[]>([]);
   const [storeToolPayload, setStoreToolPayload] = useState<boolean>(true);
   const [bearerKeys, setBearerKeys] = useState<BearerKey[]>([]);
 
@@ -468,6 +485,12 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
             data.data.systemConfig.smartRouting.azureOpenaiEmbeddingModel || '',
           progressiveDisclosure: data.data.systemConfig.smartRouting.progressiveDisclosure ?? false,
           embeddingMaxTokens: data.data.systemConfig.smartRouting.embeddingMaxTokens,
+          embeddingQueryPrefix: data.data.systemConfig.smartRouting.embeddingQueryPrefix || '',
+          embeddingDocumentPrefix:
+            data.data.systemConfig.smartRouting.embeddingDocumentPrefix || '',
+          similarityThreshold: data.data.systemConfig.smartRouting.similarityThreshold,
+          fullSchemaTopN: data.data.systemConfig.smartRouting.fullSchemaTopN,
+          toolDefinitionFields: data.data.systemConfig.smartRouting.toolDefinitionFields,
           envOverriddenFields: data.data.systemConfig.smartRouting.envOverriddenFields ?? [],
         });
       }
@@ -535,6 +558,7 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
           normalizeBetterAuthConfig(data.data?.systemConfig?.auth?.betterAuth),
         );
       }
+      if (data.success) setAllowedCidrs(data.data?.systemConfig?.network?.allowedCidrs ?? []);
       if (data.success && data.data?.systemConfig?.nameSeparator !== undefined) {
         setNameSeparator(data.data.systemConfig.nameSeparator);
       }
@@ -1026,6 +1050,25 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
     }
   };
 
+  const updateAllowedCidrs = async (value: string[]): Promise<boolean> => {
+    setLoading(true);
+    try {
+      const data = await apiPut('/system-config', { network: { allowedCidrs: value } });
+      if (!data.success) {
+        showToast(data.message || data.error || t('settings.allowedCidrsUpdateFailed'));
+        return false;
+      }
+      setAllowedCidrs(data.data.network.allowedCidrs);
+      showToast(t('settings.systemConfigUpdated'));
+      return true;
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : t('settings.allowedCidrsUpdateFailed'));
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const updateStoreToolPayload = async (value: boolean) => {
     setLoading(true);
     setError(null);
@@ -1176,6 +1219,8 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
     betterAuthConfig,
     nameSeparator,
     enableSessionRebuild,
+    allowedCidrs,
+    updateAllowedCidrs,
     storeToolPayload,
     bearerKeys,
     loading,

@@ -15,7 +15,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [20.x]
+        node-version: [20.x, 22.x]
 
     steps:
       - name: Checkout code
@@ -46,6 +46,9 @@ jobs:
 
       - name: Run tests
         run: pnpm test:ci
+
+      - name: Validate marketplace refresh
+        run: pnpm catalog:test && pnpm catalog:sync --check
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

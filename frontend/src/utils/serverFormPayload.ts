@@ -63,6 +63,13 @@ const buildOptions = (options?: ServerFormData['options']) => {
     nextOptions.maxTotalTimeout = options.maxTotalTimeout;
   }
 
+  if (options?.maxBufferSize !== undefined) {
+    if (!Number.isSafeInteger(options.maxBufferSize) || options.maxBufferSize <= 0) {
+      throw new Error('options.maxBufferSize must be a positive safe integer in bytes');
+    }
+    nextOptions.maxBufferSize = options.maxBufferSize;
+  }
+
   return nextOptions;
 };
 
@@ -74,6 +81,9 @@ const buildOAuthConfig = (
   }
 
   const nextOAuth: Partial<NonNullable<ServerConfig['oauth']>> = {};
+  if (oauth.allowInsecureTokenEndpoint !== undefined) {
+    nextOAuth.allowInsecureTokenEndpoint = oauth.allowInsecureTokenEndpoint;
+  }
   const clientId = oauth.clientId?.trim();
   const clientSecret = oauth.clientSecret?.trim();
   const scopes = oauth.scopes?.trim();
@@ -237,7 +247,7 @@ export const buildServerPayload = ({
       formData.visibility === 'group' ? normalizeSharedUsers(formData.sharedWithUsers) : undefined,
     credentialTemplate: formData.credentialTemplate?.map((slot) => ({
       ...slot,
-      target: serverType === 'stdio' ? 'env' : 'headers',
+      target: serverType === 'stdio' ? (slot.target === 'args' ? 'args' : 'env') : 'headers',
     })),
     perSessionClient: formData.perSessionClient === true ? true : undefined,
     startOnDemand: formData.startOnDemand === true ? true : undefined,

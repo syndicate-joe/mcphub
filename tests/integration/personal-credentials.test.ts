@@ -1,3 +1,4 @@
+import { RequestContextService } from '../../src/services/requestContextService.js';
 import { logger } from '../../src/utils/logger.js';
 import {
   getGroups,
@@ -13,10 +14,10 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Server as HttpServer } from 'node:http';
 import express from 'express';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { Server as McpServer } from '@modelcontextprotocol/server';
 import request from 'supertest';
-import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
   getServerDao,
   getSystemConfigDao,
@@ -25,8 +26,6 @@ import {
   getBuiltinPromptDao,
   getBuiltinResourceDao,
 } from '../../src/dao/DaoFactory.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { auth } from '../../src/middlewares/auth.js';
 import {
   sseUserContextMiddleware,
@@ -49,10 +48,16 @@ import {
   getServersInfo,
   getServerConnectionStats,
   handleCallToolRequest,
+  handleListToolsRequest,
   handleGetPromptRequest,
   handleReadResourceRequest,
 } from '../../src/services/mcpService.js';
 import { executeToolViaOpenAPI } from '../../src/controllers/openApiController.js';
+import {
+  removeServerToolEmbeddings,
+  removeToolEmbeddings,
+  saveToolsAsVectorEmbeddings,
+} from '../../src/services/vectorSearchService.js';
 import { PrincipalRuntimeService } from '../../src/services/principalRuntimeService.js';
 import { UserContextService } from '../../src/services/userContextService.js';
 import { createOAuthProvider } from '../../src/services/mcpOAuthProvider.js';
@@ -68,6 +73,7 @@ import type { McpSettings } from '../../src/types/index.js';
 jest.mock('../../src/services/oauthService.js', () => ({ initializeAllOAuthClients: jest.fn() }));
 jest.mock('../../src/services/vectorSearchService.js', () => ({
   removeServerToolEmbeddings: jest.fn(),
+  removeToolEmbeddings: jest.fn(),
   saveToolsAsVectorEmbeddings: jest.fn(),
   syncAllServerToolsEmbeddings: jest.fn(),
 }));
@@ -217,6 +223,78 @@ const connect = async (username: string, serverName = 'shared') => {
   );
   return client;
 };
+
+test('args credentials reach the child literally, isolate users, and redact failures', async () => {
+  const name = 'argsShared';
+  await getServerDao().create({
+    name,
+    type: 'stdio',
+    command: process.execPath,
+    args: [fixture, '{{args.KEY}}', '--again={{args.KEY}}', '$STATIC_ARG'],
+    env: { STATIC_ARG: 'operator-value' },
+    owner: 'admin',
+    visibility: 'public',
+    credentialTemplate: [{ target: 'args', name: 'KEY' }],
+  });
+  await initializeClientsFromSettings(false);
+  const values = ['  alice "quoted" $STATIC_ARG ${HOME} {{args.KEY}} ;&  ', 'bob-secret'];
+  const log = jest.spyOn(logger, 'error');
+  const warn = jest.spyOn(logger, 'warn');
+  const info = jest.spyOn(logger, 'log');
+  try {
+    for (const [index, username] of [alice, bob].entries()) {
+      const saved = await request(app)
+        .put(`/api/credentials/${name}`)
+        .set('x-auth-token', apiToken(username))
+        .send({ values: { 'args.KEY': values[index] } });
+      expect(saved.status).toBe(200);
+    }
+    const [a, b] = await Promise.all([connect(alice, name), connect(bob, name)]);
+    const toolName = (await a.listTools()).tools[0].name;
+    const results = await Promise.all([a, b].map((client) => client.callTool({ name: toolName })));
+    for (const [index, result] of results.entries()) {
+      expect(parseIdentity(result).args).toEqual([
+        values[index],
+        `--again=${values[index]}`,
+        'operator-value',
+      ]);
+    }
+    const failure = await a.callTool({ name: toolName, arguments: { fail: true } });
+    expect(failure.isError).toBe(true);
+    expect(JSON.stringify(failure)).toContain('Unsupported input');
+    expect(JSON.stringify(failure)).not.toContain('alice');
+    const status = await request(app).get('/api/credentials').set('x-auth-token', apiToken(alice));
+    expect(JSON.stringify(status.body)).not.toContain(values[0]);
+    const config = await request(app)
+      .get(`/api/servers/${name}`)
+      .set('x-auth-token', apiToken(alice));
+    expect(config.body.data.config).not.toHaveProperty('args');
+    expect(JSON.stringify(log.mock.calls)).not.toContain('quoted');
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('quoted');
+    expect(JSON.stringify(info.mock.calls)).not.toContain('quoted');
+    expect((await getServerDao().findById(name))?.args).toEqual([
+      fixture,
+      '{{args.KEY}}',
+      '--again={{args.KEY}}',
+      '$STATIC_ARG',
+    ]);
+    await request(app)
+      .put(`/api/credentials/${name}`)
+      .set('x-auth-token', apiToken(alice))
+      .send({ values: { 'args.KEY': 'rotated-secret' } });
+    expect(parseIdentity(await a.callTool({ name: toolName })).credential).toBe('rotated-secret');
+    expect(parseIdentity(await b.callTool({ name: toolName })).credential).toBe(values[1]);
+    await request(app).delete(`/api/credentials/${name}`).set('x-auth-token', apiToken(alice));
+    expect((await a.callTool({ name: toolName })).isError).toBe(true);
+    expect(parseIdentity(await b.callTool({ name: toolName })).credential).toBe(values[1]);
+  } finally {
+    log.mockRestore();
+    warn.mockRestore();
+    info.mockRestore();
+    await getServerDao().delete(name);
+    await initializeClientsFromSettings(true);
+  }
+});
 
 test('dashboard bindings are write-only, self-scoped, and preserve the shared safe view', async () => {
   expect(getServerConnectionStats()).toEqual({ total: 0, connected: 0, disconnected: 0 });
@@ -386,15 +464,15 @@ test('HTTP and OpenAPI resolve the latest personal headers without passthrough o
       { name: 'http-fixture', version: '1' },
       { capabilities: { tools: {} } },
     );
-    upstream.setRequestHandler(ListToolsRequestSchema, async () => ({
+    upstream.setRequestHandler('tools/list', async () => ({
       tools: [{ name: 'identity', inputSchema: { type: 'object' } }],
     }));
-    upstream.setRequestHandler(CallToolRequestSchema, async () => ({
+    upstream.setRequestHandler('tools/call', async () => ({
       content: [
         { type: 'text', text: JSON.stringify({ credential: req.headers['x-personal-key'] }) },
       ],
     }));
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on('close', () => {
       void transport.close();
       void upstream.close();
@@ -686,6 +764,19 @@ test.each(['-', '__'])(
     await initializeClientsFromSettings(true);
     const acquire = jest.spyOn(PrincipalRuntimeService.prototype, 'acquire');
     try {
+      await UserContextService.getInstance().runWithContext(
+        () =>
+          RequestContextService.getInstance().runWithCustomRequestContext(
+            { headers: {}, group: group.name },
+            async () => {
+              const result = await handleListToolsRequest({}, { group: 'missing-group' });
+              expect(result.tools.map((tool) => tool.name).sort()).toEqual(
+                [`demo${separator}identity`, `demo${separator}cred${separator}identity`].sort(),
+              );
+            },
+          ),
+        { username: alice, password: '', isAdmin: false },
+      );
       for (const smart of [false, true]) {
         acquire.mockClear();
         const toolName = `demo${separator}cred${separator}identity`;
@@ -769,4 +860,74 @@ test('HTTP handshake failures survive acquisition wrappers without credential bl
   } finally {
     log.mockRestore();
   }
+});
+
+const settleUntil = async (done: () => boolean) => {
+  for (let attempt = 0; attempt < 100 && !done(); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+};
+
+test('a per-user connect adds the tools it lists, and removes by name only the disabled ones', async () => {
+  const save = jest.mocked(saveToolsAsVectorEmbeddings);
+  const removeServer = jest.mocked(removeServerToolEmbeddings);
+  const removeTools = jest.mocked(removeToolEmbeddings);
+  const name = `shared${getNameSeparator()}identity`;
+  save.mockClear();
+  // A rotated binding forces a fresh per-user runtime on the next request.
+  await bind(alice, 'index-sentinel');
+  await (await connect(alice)).listTools();
+  await settleUntil(() => save.mock.calls.length > 0);
+  // One user's list is not the whole server's: add and refresh, never prune
+  expect(save).toHaveBeenCalledWith('shared', [expect.objectContaining({ name })], {
+    partial: true,
+  });
+  expect(JSON.stringify(save.mock.calls)).not.toContain('index-sentinel');
+
+  const original = (await getServerDao().findById('shared'))?.tools ?? {};
+  await getServerDao().updateTools('shared', { identity: { enabled: false } });
+  try {
+    save.mockClear();
+    removeServer.mockClear();
+    removeTools.mockClear();
+    // The tools config is part of the runtime revision, so this reconnects.
+    await (await connect(alice)).listTools();
+    await settleUntil(() => removeTools.mock.calls.length > 0);
+    expect(removeTools).toHaveBeenCalledWith('shared', [name]);
+    expect(removeServer).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  } finally {
+    await getServerDao().updateTools('shared', original);
+  }
+});
+
+test('a user who sees fewer tools does not remove the others from the shared index', async () => {
+  const save = jest.mocked(saveToolsAsVectorEmbeddings);
+  const removeServer = jest.mocked(removeServerToolEmbeddings);
+  const removeTools = jest.mocked(removeToolEmbeddings);
+  const separator = getNameSeparator();
+  const listedNames = (call: unknown[]) => (call[1] as Array<{ name: string }>).map((t) => t.name);
+
+  // Alice's credential lists identity and rotate_identity, Bob's only identity
+  await bind(alice, 'full-alice');
+  save.mockClear();
+  await (await connect(alice)).listTools();
+  await settleUntil(() => save.mock.calls.length > 0);
+  expect(listedNames(save.mock.calls[0])).toEqual([
+    `shared${separator}identity`,
+    `shared${separator}rotate_identity`,
+  ]);
+
+  await bind(bob, 'bob-only');
+  save.mockClear();
+  removeServer.mockClear();
+  removeTools.mockClear();
+  await (await connect(bob)).listTools();
+  await settleUntil(() => save.mock.calls.length > 0);
+
+  expect(listedNames(save.mock.calls[0])).toEqual([`shared${separator}identity`]);
+  // partial: the vector store leaves rotate_identity's row alone
+  expect(save.mock.calls[0][2]).toEqual({ partial: true });
+  expect(removeServer).not.toHaveBeenCalled();
+  expect(removeTools).not.toHaveBeenCalled();
 });

@@ -52,7 +52,11 @@ export const mutateOAuthSettings = async (
 
   mutator(context);
 
-  const updated = await serverDao.update(serverName, { oauth: serverConfig.oauth });
+  const updated = await serverDao.update(
+    serverName,
+    { oauth: serverConfig.oauth },
+    { runtimeOAuth: true },
+  );
   if (!updated) {
     throw new Error(`Failed to persist OAuth settings for server ${serverName}`);
   }
@@ -75,7 +79,9 @@ export const persistClientCredentials = async (
     oauth.clientId = credentials.clientId;
     oauth.clientSecret = credentials.clientSecret;
 
-    if (credentials.scopes && credentials.scopes.length > 0) {
+    // `!== undefined` (not `.length > 0`): an explicitly empty scope list is a meaningful
+    // result (the upstream server uses no scopes) and must be persisted, not dropped (#1227).
+    if (credentials.scopes !== undefined) {
       oauth.scopes = credentials.scopes;
     }
     if (credentials.authorizationEndpoint) {
@@ -94,8 +100,10 @@ export const persistClientCredentials = async (
   }
 
   logger.log(`Persisted OAuth client credentials for server: ${serverName}`);
-  if (credentials.scopes && credentials.scopes.length > 0) {
-    logger.log(`Stored OAuth scopes for ${serverName}: ${credentials.scopes.join(', ')}`);
+  if (credentials.scopes !== undefined) {
+    logger.log(
+      `Stored OAuth scopes for ${serverName}: ${credentials.scopes.length > 0 ? credentials.scopes.join(', ') : '(none)'}`,
+    );
   }
 
   return updated;
@@ -150,7 +158,7 @@ export const updatePendingAuthorization = async (
  */
 export const clearOAuthData = async (
   serverName: string,
-  scope: 'all' | 'client' | 'tokens' | 'verifier',
+  scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery',
 ): Promise<ServerConfigWithOAuth | undefined> => {
   return mutateOAuthSettings(serverName, ({ oauth }) => {
     if (scope === 'tokens' || scope === 'all') {
@@ -161,6 +169,12 @@ export const clearOAuthData = async (
     if (scope === 'client' || scope === 'all') {
       delete oauth.clientId;
       delete oauth.clientSecret;
+    }
+
+    if (scope === 'discovery' && oauth.pendingAuthorization) {
+      delete oauth.pendingAuthorization.discoveryState;
+      delete oauth.pendingAuthorization.issuer;
+      delete oauth.pendingAuthorization.issRequired;
     }
 
     if (scope === 'verifier' || scope === 'all') {

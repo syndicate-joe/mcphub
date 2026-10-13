@@ -44,20 +44,23 @@ const ensureOAuthServerDefaults = (settings: McpSettings): boolean => {
 // Settings cache
 let settingsCache: McpSettings | null = null;
 // mtime of the settings file our cache snapshot was read from. The file is
-// re-read when it is newer, mirroring JsonFileBaseDao so system settings do
+// re-read when it changes, mirroring JsonFileBaseDao so system settings do
 // not behave differently from server definitions on external edits (#1081).
 let lastModified = 0;
+// In-process writes can share the same filesystem mtime.
+let settingsGeneration = 0;
+export const getSettingsGeneration = (): number => settingsGeneration;
 
 export const getSettingsPath = (): string => {
   return getConfigFilePath('mcp_settings.json', 'Settings');
 };
 
-export const loadOriginalSettings = (): McpSettings => {
+export const loadOriginalSettings = (persistDefaults = true): McpSettings => {
   // If cache exists and the file hasn't changed, return cached data directly.
   if (settingsCache) {
     try {
       const stats = fs.statSync(getSettingsPath());
-      if (lastModified >= stats.mtime.getTime()) {
+      if (lastModified === stats.mtimeMs) {
         return settingsCache;
       }
     } catch {
@@ -83,9 +86,10 @@ export const loadOriginalSettings = (): McpSettings => {
     const settingsData = fs.readFileSync(settingsPath, 'utf8');
     const settings = JSON.parse(settingsData);
     const initialized = ensureOAuthServerDefaults(settings);
-    if (initialized) {
+    if (initialized && persistDefaults) {
       try {
         fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
+        clearSettingsCache();
       } catch (writeError) {
         logger.error('Failed to persist default OAuth server configuration', {
           writeError,
@@ -97,7 +101,7 @@ export const loadOriginalSettings = (): McpSettings => {
     // Update cache
     settingsCache = settings;
     try {
-      lastModified = fs.statSync(settingsPath).mtime.getTime();
+      lastModified = fs.statSync(settingsPath).mtimeMs;
     } catch {
       lastModified = Date.now();
     }
@@ -105,7 +109,7 @@ export const loadOriginalSettings = (): McpSettings => {
     logger.log(`Loaded settings from ${settingsPath}`);
     return settings;
   } catch (error) {
-    throw new Error(`Failed to load settings from ${settingsPath}: ${error}`);
+    throw new Error(`Failed to load settings from ${settingsPath}: ${error}`, { cause: error });
   }
 };
 
@@ -119,9 +123,10 @@ export const saveSettings = (settings: McpSettings, user?: IUser): boolean => {
     const mergedSettings = dataService.mergeSettings!(loadOriginalSettings(), settings, user);
     fs.writeFileSync(settingsPath, JSON.stringify(mergedSettings, null, 2), 'utf8');
 
-    // Update cache after successful save
+    // Invalidate every DAO snapshot, including writes in the same mtime tick.
+    clearSettingsCache();
     settingsCache = mergedSettings;
-    lastModified = Date.now();
+    lastModified = fs.statSync(settingsPath).mtimeMs;
 
     return true;
   } catch (error) {
@@ -134,6 +139,7 @@ export const saveSettings = (settings: McpSettings, user?: IUser): boolean => {
  * Clear settings cache, force next loadSettings call to re-read from file
  */
 export const clearSettingsCache = (): void => {
+  settingsGeneration += 1;
   settingsCache = null;
   lastModified = 0;
 };
@@ -205,12 +211,20 @@ export function replaceEnvVars(
   return input;
 }
 
+const isVarNameStart = (char: string | undefined): boolean =>
+  char !== undefined && ((char >= 'A' && char <= 'Z') || char === '_');
+
+const isVarNameChar = (char: string | undefined): boolean =>
+  isVarNameStart(char) || (char !== undefined && char >= '0' && char <= '9');
+
 /**
- * Expand `${VAR}` references via a linear scan. A manual scan is used instead
- * of a regular expression so that adversarial input (many '${' sequences)
- * cannot trigger catastrophic backtracking.
+ * Expand `${VAR}` and `$VAR` references in a single linear scan. Substituted
+ * values are copied as-is and never scanned again, so a secret containing
+ * `$` (e.g. `Pa$SWORD`) is not expanded a second time. A manual scan is used
+ * instead of a regular expression so that adversarial input (many '${'
+ * sequences) cannot trigger catastrophic backtracking.
  */
-const expandDollarBraceVars = (
+const expandVarReferences = (
   value: string,
   envSource: Record<string, string | undefined>,
 ): string => {
@@ -225,6 +239,15 @@ const expandDollarBraceVars = (
         i = closeIndex + 1;
         continue;
       }
+    } else if (value[i] === '$' && isVarNameStart(value[i + 1])) {
+      // $VAR format (common on Unix-like systems)
+      let end = i + 2;
+      while (isVarNameChar(value[end])) {
+        end += 1;
+      }
+      result += envSource[value.slice(i + 1, end)] || '';
+      i = end;
+      continue;
     }
     result += value[i];
     i += 1;
@@ -244,11 +267,7 @@ export const expandEnvVars = (
   if (typeof value !== 'string') {
     return String(value);
   }
-  // Replace ${VAR} format
-  let result = expandDollarBraceVars(value, envSource);
-  // Also replace $VAR format (common on Unix-like systems)
-  result = result.replace(/\$([A-Z_][A-Z0-9_]*)/g, (_, key) => envSource[key] || '');
-  return result.trim();
+  return expandVarReferences(value, envSource).trim();
 };
 
 export default defaultConfig;

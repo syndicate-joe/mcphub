@@ -55,7 +55,7 @@ MCPHub 是 AI 客户端与 MCP 服务器之间的统一控制点。一次连接�
 ### 前置条件
 
 - **Docker**（推荐）—— 运行 MCPHub 最快的方式，下面的命令都基于它
-- **Node.js** `^18.0.0 || >=20.0.0` 和 **pnpm** `10.12.4` —— 仅从源码运行或参与本地开发时需要（见[本地开发](#本地开发)）
+- **Node.js** `>=20.0.0` 和 **pnpm** `10.12.4` —— 仅从源码运行或参与本地开发时需要（见[本地开发](#本地开发)）
 
 ### 使用 Docker 启动
 
@@ -182,11 +182,15 @@ pnpm dev
 
 如果觉得项目有帮助，不妨请我喝杯咖啡 ☕️
 
+[![Sponsor samanhappy](https://img.shields.io/badge/Sponsor-samanhappy-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/samanhappy)
+
 <img src="assets/reward.png" width="350">
 
 海外用户可通过 [ko-fi](https://ko-fi.com/samanhappy) 支持。
 
 ## 致谢
+
+- [AtomGit](https://atomgit.com/samanhappy/mcphub)：为 MCPHub 提供国内代码托管，方便中国大陆用户访问项目。
 
 感谢以下朋友的赞赏：小白、唐秀川、琛、孔、黄祥取、兰军飞、无名之辈、Kyle，以及其他匿名支持者。
 

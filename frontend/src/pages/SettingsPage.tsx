@@ -448,6 +448,43 @@ function parseEmbeddingDimensionsForUpdate(
   return parsed !== currentValue ? parsed : undefined;
 }
 
+/**
+ * Parses an optional search setting (similarity threshold, full-schema top N).
+ * Empty clears it back to the default (null), a value `parse` accepts is sent
+ * as a number, and anything else or an unchanged value sends nothing.
+ */
+function parseOptionalSearchSettingForUpdate(
+  rawValue: string,
+  currentValue: number | null | undefined,
+  parse: (value: number) => boolean,
+): number | null | undefined {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return currentValue == null ? undefined : null;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || !parse(parsed)) {
+    return undefined;
+  }
+
+  return parsed !== currentValue ? parsed : undefined;
+}
+
+const isSimilarityThreshold = (value: number) => value >= 0 && value <= 1;
+const isFullSchemaTopN = (value: number) => Number.isInteger(value) && value >= 0;
+// Mirrors TOOL_DEFINITION_FIELDS / DEFAULT_TOOL_DEFINITION_FIELDS in
+// src/constants/smartRoutingDefaults.ts (the server validates against those)
+const TOOL_DEFINITION_FIELDS = [
+  'title',
+  'annotations',
+  'outputSchema',
+  'execution',
+  'icons',
+  '_meta',
+] as const;
+const DEFAULT_TOOL_DEFINITION_FIELDS: readonly string[] = ['title', 'annotations'];
+
 function parseBasePacingDelayForUpdate(
   rawValue: string,
   currentValue: number | null | undefined,
@@ -498,6 +535,11 @@ const SettingsPage: React.FC = () => {
     azureOpenaiEmbeddingModel: string;
     // Empty string = use model default; numeric string = explicit override
     embeddingMaxTokens: string;
+    embeddingQueryPrefix: string;
+    embeddingDocumentPrefix: string;
+    // Empty string = default (query heuristic / every hit in full)
+    similarityThreshold: string;
+    fullSchemaTopN: string;
   }>({
     dbUrl: '',
     basePacingDelayMs: '',
@@ -515,6 +557,10 @@ const SettingsPage: React.FC = () => {
     azureOpenaiEmbeddingDeployment: '',
     azureOpenaiEmbeddingModel: '',
     embeddingMaxTokens: '',
+    embeddingQueryPrefix: '',
+    embeddingDocumentPrefix: '',
+    similarityThreshold: '',
+    fullSchemaTopN: '',
   });
 
   const [tempToolResultCompressionConfig, setTempToolResultCompressionConfig] = useState<{
@@ -593,6 +639,8 @@ const SettingsPage: React.FC = () => {
     betterAuthConfig,
     nameSeparator,
     enableSessionRebuild,
+    allowedCidrs,
+    updateAllowedCidrs,
     storeToolPayload,
     loading,
     bearerKeys,
@@ -614,6 +662,11 @@ const SettingsPage: React.FC = () => {
     deleteBearerKey,
     refreshBearerKeys,
   } = useSettingsData();
+
+  const [tempAllowedCidrs, setTempAllowedCidrs] = useState('');
+  useEffect(() => {
+    setTempAllowedCidrs(allowedCidrs.join('\n'));
+  }, [allowedCidrs]);
 
   // Smart routing resolves env vars first, so a value typed here can be shadowed
   // without any visible change: the form shows the key you just pasted while the
@@ -679,6 +732,16 @@ const SettingsPage: React.FC = () => {
         embeddingMaxTokens:
           smartRoutingConfig.embeddingMaxTokens != null
             ? String(smartRoutingConfig.embeddingMaxTokens)
+            : '',
+        embeddingQueryPrefix: smartRoutingConfig.embeddingQueryPrefix || '',
+        embeddingDocumentPrefix: smartRoutingConfig.embeddingDocumentPrefix || '',
+        similarityThreshold:
+          smartRoutingConfig.similarityThreshold != null
+            ? String(smartRoutingConfig.similarityThreshold)
+            : '',
+        fullSchemaTopN:
+          smartRoutingConfig.fullSchemaTopN != null
+            ? String(smartRoutingConfig.fullSchemaTopN)
             : '',
       });
     }
@@ -910,7 +973,11 @@ const SettingsPage: React.FC = () => {
       | 'azureOpenaiApiVersion'
       | 'azureOpenaiEmbeddingDeployment'
       | 'azureOpenaiEmbeddingModel'
-      | 'embeddingMaxTokens',
+      | 'embeddingMaxTokens'
+      | 'embeddingQueryPrefix'
+      | 'embeddingDocumentPrefix'
+      | 'similarityThreshold'
+      | 'fullSchemaTopN',
     value: string,
   ) => {
     setTempSmartRoutingConfig({
@@ -1128,6 +1195,29 @@ const SettingsPage: React.FC = () => {
     await updateNameSeparator(tempNameSeparator);
   };
 
+  // Labels of the search settings the API would reject. Saving stops on any of
+  // them instead of silently leaving the stored value in place.
+  const getInvalidSearchSettingLabels = (): string[] => {
+    const invalid: string[] = [];
+    const threshold = tempSmartRoutingConfig.similarityThreshold.trim();
+    if (threshold && !isSimilarityThreshold(Number(threshold))) {
+      invalid.push(t('settings.similarityThreshold'));
+    }
+    const topN = tempSmartRoutingConfig.fullSchemaTopN.trim();
+    if (topN && !isFullSchemaTopN(Number(topN))) {
+      invalid.push(t('settings.fullSchemaTopN'));
+    }
+    return invalid;
+  };
+
+  const reportInvalidSearchSettings = (): boolean => {
+    const invalid = getInvalidSearchSettingLabels();
+    if (invalid.length > 0) {
+      showToast(t('settings.invalidSearchSettings', { fields: invalid.join(', ') }), 'error');
+    }
+    return invalid.length > 0;
+  };
+
   const handleSmartRoutingEnabledChange = async (value: boolean) => {
     // If enabling Smart Routing, validate required fields and save any unsaved changes
     if (value) {
@@ -1186,6 +1276,9 @@ const SettingsPage: React.FC = () => {
             fields: missingFields.join(', '),
           }),
         );
+        return;
+      }
+      if (reportInvalidSearchSettings()) {
         return;
       }
 
@@ -1250,6 +1343,19 @@ const SettingsPage: React.FC = () => {
         updates.azureOpenaiEmbeddingModel = tempSmartRoutingConfig.azureOpenaiEmbeddingModel;
       }
 
+      if (
+        tempSmartRoutingConfig.embeddingQueryPrefix !==
+        (smartRoutingConfig.embeddingQueryPrefix || '')
+      ) {
+        updates.embeddingQueryPrefix = tempSmartRoutingConfig.embeddingQueryPrefix;
+      }
+      if (
+        tempSmartRoutingConfig.embeddingDocumentPrefix !==
+        (smartRoutingConfig.embeddingDocumentPrefix || '')
+      ) {
+        updates.embeddingDocumentPrefix = tempSmartRoutingConfig.embeddingDocumentPrefix;
+      }
+
       // embeddingMaxTokens: empty string → null (clear override), numeric string → number
       const parsedTokens = parseEmbeddingMaxTokensForUpdate(
         tempSmartRoutingConfig.embeddingMaxTokens,
@@ -1265,6 +1371,22 @@ const SettingsPage: React.FC = () => {
       if (parsedDimensions !== undefined) {
         updates.embeddingDimensions = parsedDimensions;
       }
+      const parsedThreshold = parseOptionalSearchSettingForUpdate(
+        tempSmartRoutingConfig.similarityThreshold,
+        smartRoutingConfig.similarityThreshold,
+        isSimilarityThreshold,
+      );
+      if (parsedThreshold !== undefined) {
+        updates.similarityThreshold = parsedThreshold;
+      }
+      const parsedTopN = parseOptionalSearchSettingForUpdate(
+        tempSmartRoutingConfig.fullSchemaTopN,
+        smartRoutingConfig.fullSchemaTopN,
+        isFullSchemaTopN,
+      );
+      if (parsedTopN !== undefined) {
+        updates.fullSchemaTopN = parsedTopN;
+      }
 
       // Save all changes in a single batch update
       await updateSmartRoutingConfigBatch(updates);
@@ -1275,6 +1397,9 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleSaveSmartRoutingConfig = async () => {
+    if (reportInvalidSearchSettings()) {
+      return;
+    }
     const updates: any = {};
 
     if (tempSmartRoutingConfig.dbUrl !== smartRoutingConfig.dbUrl) {
@@ -1330,6 +1455,19 @@ const SettingsPage: React.FC = () => {
       updates.azureOpenaiEmbeddingModel = tempSmartRoutingConfig.azureOpenaiEmbeddingModel;
     }
 
+    if (
+      tempSmartRoutingConfig.embeddingQueryPrefix !==
+      (smartRoutingConfig.embeddingQueryPrefix || '')
+    ) {
+      updates.embeddingQueryPrefix = tempSmartRoutingConfig.embeddingQueryPrefix;
+    }
+    if (
+      tempSmartRoutingConfig.embeddingDocumentPrefix !==
+      (smartRoutingConfig.embeddingDocumentPrefix || '')
+    ) {
+      updates.embeddingDocumentPrefix = tempSmartRoutingConfig.embeddingDocumentPrefix;
+    }
+
     // embeddingMaxTokens: empty string → null (clear override), numeric string → number
     const parsedEmbeddingMaxTokens = parseEmbeddingMaxTokensForUpdate(
       tempSmartRoutingConfig.embeddingMaxTokens,
@@ -1344,6 +1482,22 @@ const SettingsPage: React.FC = () => {
     );
     if (parsedEmbeddingDimensions !== undefined) {
       updates.embeddingDimensions = parsedEmbeddingDimensions;
+    }
+    const parsedSimilarityThreshold = parseOptionalSearchSettingForUpdate(
+      tempSmartRoutingConfig.similarityThreshold,
+      smartRoutingConfig.similarityThreshold,
+      isSimilarityThreshold,
+    );
+    if (parsedSimilarityThreshold !== undefined) {
+      updates.similarityThreshold = parsedSimilarityThreshold;
+    }
+    const parsedFullSchemaTopN = parseOptionalSearchSettingForUpdate(
+      tempSmartRoutingConfig.fullSchemaTopN,
+      smartRoutingConfig.fullSchemaTopN,
+      isFullSchemaTopN,
+    );
+    if (parsedFullSchemaTopN !== undefined) {
+      updates.fullSchemaTopN = parsedFullSchemaTopN;
     }
 
     if (Object.keys(updates).length > 0) {
@@ -1655,7 +1809,7 @@ const SettingsPage: React.FC = () => {
           {sectionsVisible.bearerKeys && (
             <div className="space-y-4 pb-4 px-6 pt-4 border-t border-[var(--hub-line-2)]">
               {createdBearerToken && (
-                <div className="p-3 rounded-md border border-amber-300 bg-amber-50 text-sm">
+                <div className="p-3 rounded-md border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-900/20 dark:text-amber-300 text-sm">
                   <div className="font-medium">
                     {t('settings.bearerKeyShownOnce') || 'Copy this token now. It will not be shown again.'}
                   </div>
@@ -2231,490 +2385,605 @@ const SettingsPage: React.FC = () => {
               >
                 <span>{t('settings.smartRoutingRequiredFields')}</span>
               </div>
-
               <div className="space-y-3 hub-sr-fields">
+                {/* hide when DB_URL env is set */}
+                {smartRoutingConfig.dbUrl !== '${DB_URL}' && (
+                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <div className="mb-2">
+                      <h3 className="font-medium text-gray-700">
+                        <span className="text-red-500 px-1">*</span>
+                        {t('settings.dbUrl')}
+                      </h3>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="text"
+                        value={tempSmartRoutingConfig.dbUrl}
+                        onChange={(e) => handleSmartRoutingConfigChange('dbUrl', e.target.value)}
+                        placeholder={t('settings.dbUrlPlaceholder')}
+                        className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300 form-input"
+                        disabled={loading}
+                      />
+                    </div>
+                  </div>
+                )}
 
-              {/* hide when DB_URL env is set */}
-              {smartRoutingConfig.dbUrl !== '${DB_URL}' && (
                 <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                   <div className="mb-2">
                     <h3 className="font-medium text-gray-700">
-                      <span className="text-red-500 px-1">*</span>
-                      {t('settings.dbUrl')}
+                      {t('settings.embeddingProvider') || 'Embedding Provider'}
                     </h3>
                   </div>
                   <div className="flex items-center gap-3">
+                    <select
+                      className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 bg-white dark:bg-gray-800 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
+                      value={tempSmartRoutingConfig.embeddingProvider}
+                      onChange={(e) =>
+                        handleSmartRoutingConfigChange(
+                          'embeddingProvider',
+                          e.target.value as 'openai' | 'azure_openai',
+                        )
+                      }
+                      disabled={loading}
+                    >
+                      <option value="openai">OpenAI (or compatible)</option>
+                      <option value="azure_openai">Azure OpenAI</option>
+                    </select>
+                  </div>
+                </div>
+
+                {tempSmartRoutingConfig.embeddingProvider === 'openai' ? (
+                  <>
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          {t('settings.embeddingProviderPreset') || 'Provider Preset'}
+                        </h3>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {t('settings.embeddingProviderPresetDescription') ||
+                            'Choose a provider to prefill its OpenAI-compatible endpoint and model.'}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <select
+                          value={tempSmartRoutingConfig.embeddingProviderPreset}
+                          onChange={(e) =>
+                            handleEmbeddingProviderPresetChange(
+                              e.target.value as EmbeddingProviderPresetId,
+                            )
+                          }
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 bg-white dark:bg-gray-800 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
+                          disabled={loading}
+                        >
+                          <option value="openai">
+                            {t('settings.embeddingProviderPresetOpenai') || 'OpenAI'}
+                          </option>
+                          <option value="openrouter">
+                            {t('settings.embeddingProviderPresetOpenrouter') || 'OpenRouter'}
+                          </option>
+                          <option value="siliconflow">
+                            {t('settings.embeddingProviderPresetSiliconflow') ||
+                              'SiliconFlow · free tier'}
+                          </option>
+                          <option value="gemini">
+                            {t('settings.embeddingProviderPresetGemini') ||
+                              'Google Gemini · free tier'}
+                          </option>
+                          <option value="custom">
+                            {t('settings.embeddingProviderPresetCustom') ||
+                              'Other / OpenAI-compatible'}
+                          </option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.llmProviderApiKey')}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="password"
+                          value={tempSmartRoutingConfig.llmProviderApiKey}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange('llmProviderApiKey', e.target.value)
+                          }
+                          placeholder={t('settings.llmProviderApiKeyPlaceholder')}
+                          className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300"
+                          disabled={loading}
+                        />
+                      </div>
+                      {renderEnvOverrideWarning('llmProviderApiKey')}
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.llmProviderBaseUrl')}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="text"
+                          value={tempSmartRoutingConfig.llmProviderBaseUrl}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange('llmProviderBaseUrl', e.target.value)
+                          }
+                          placeholder={t('settings.llmProviderBaseUrlPlaceholder')}
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                          disabled={loading}
+                          required
+                        />
+                      </div>
+                      {renderEnvOverrideWarning('llmProviderBaseUrl')}
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.embeddingModel')}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="text"
+                          value={tempSmartRoutingConfig.embeddingModel}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange('embeddingModel', e.target.value)
+                          }
+                          placeholder={t('settings.embeddingModelPlaceholder')}
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                          disabled={loading}
+                          required
+                        />
+                      </div>
+                      {renderEnvOverrideWarning('embeddingModel')}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.azureOpenaiEndpoint') || 'Azure OpenAI Endpoint'}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="text"
+                          value={tempSmartRoutingConfig.azureOpenaiEndpoint}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange('azureOpenaiEndpoint', e.target.value)
+                          }
+                          placeholder={
+                            t('settings.azureOpenaiEndpointPlaceholder') ||
+                            'https://YOUR_RESOURCE_NAME.openai.azure.com'
+                          }
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                          disabled={loading}
+                        />
+                      </div>
+                      {renderEnvOverrideWarning('azureOpenaiEndpoint')}
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.azureOpenaiApiKey') || 'Azure OpenAI API Key'}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="password"
+                          value={tempSmartRoutingConfig.azureOpenaiApiKey}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange('azureOpenaiApiKey', e.target.value)
+                          }
+                          placeholder={t('settings.azureOpenaiApiKeyPlaceholder') || '***'}
+                          className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300"
+                          disabled={loading}
+                        />
+                      </div>
+                      {renderEnvOverrideWarning('azureOpenaiApiKey')}
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.azureOpenaiApiVersion') || 'Azure OpenAI API Version'}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="text"
+                          value={tempSmartRoutingConfig.azureOpenaiApiVersion}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange('azureOpenaiApiVersion', e.target.value)
+                          }
+                          placeholder={
+                            t('settings.azureOpenaiApiVersionPlaceholder') || '2024-02-15-preview'
+                          }
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                          disabled={loading}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.azureOpenaiEmbeddingDeployment') ||
+                            'Azure Embedding Deployment'}
+                        </h3>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="text"
+                          value={tempSmartRoutingConfig.azureOpenaiEmbeddingDeployment}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange(
+                              'azureOpenaiEmbeddingDeployment',
+                              e.target.value,
+                            )
+                          }
+                          placeholder={
+                            t('settings.azureOpenaiEmbeddingDeploymentPlaceholder') ||
+                            'your-embedding-deployment-name'
+                          }
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                          disabled={loading}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <div className="mb-2">
+                        <h3 className="font-medium text-gray-700">
+                          <span className="text-red-500 px-1">*</span>
+                          {t('settings.azureOpenaiEmbeddingModel') || 'Azure Embedding Model Name'}
+                        </h3>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {t('settings.azureOpenaiEmbeddingModelDescription') ||
+                            'The actual OpenAI model name deployed in Azure (e.g. text-embedding-3-small). Used for accurate token counting.'}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="text"
+                          value={tempSmartRoutingConfig.azureOpenaiEmbeddingModel}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange(
+                              'azureOpenaiEmbeddingModel',
+                              e.target.value,
+                            )
+                          }
+                          placeholder={
+                            t('settings.azureOpenaiEmbeddingModelPlaceholder') ||
+                            'text-embedding-3-small'
+                          }
+                          className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                          disabled={loading}
+                          required
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">
+                      {t('settings.embeddingDimensions') || 'Embedding Dimensions'}
+                    </h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.embeddingDimensionsDescription') ||
+                        "Optional output size for providers that support it. Leave empty to use the model's default."}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
                     <input
-                      type="text"
-                      value={tempSmartRoutingConfig.dbUrl}
-                      onChange={(e) => handleSmartRoutingConfigChange('dbUrl', e.target.value)}
-                      placeholder={t('settings.dbUrlPlaceholder')}
-                      className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300 form-input"
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={tempSmartRoutingConfig.embeddingDimensions}
+                      onChange={(e) =>
+                        handleSmartRoutingConfigChange('embeddingDimensions', e.target.value)
+                      }
+                      placeholder={
+                        t('settings.embeddingDimensionsPlaceholder') || 'Empty = model default'
+                      }
+                      className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
                       disabled={loading}
                     />
                   </div>
-                </div>
-              )}
-
-              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                <div className="mb-2">
-                  <h3 className="font-medium text-gray-700">
-                    {t('settings.embeddingProvider') || 'Embedding Provider'}
-                  </h3>
-                </div>
-                <div className="flex items-center gap-3">
-                  <select
-                    className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 bg-white dark:bg-gray-800 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
-                    value={tempSmartRoutingConfig.embeddingProvider}
-                    onChange={(e) =>
-                      handleSmartRoutingConfigChange(
-                        'embeddingProvider',
-                        e.target.value as 'openai' | 'azure_openai',
-                      )
-                    }
-                    disabled={loading}
-                  >
-                    <option value="openai">OpenAI (or compatible)</option>
-                    <option value="azure_openai">Azure OpenAI</option>
-                  </select>
-                </div>
-              </div>
-
-              {tempSmartRoutingConfig.embeddingProvider === 'openai' ? (
-                <>
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        {t('settings.embeddingProviderPreset') || 'Provider Preset'}
-                      </h3>
+                  <div className="flex items-center justify-between mt-3">
+                    <div>
+                      <h4 className="font-medium text-gray-700">
+                        {t('settings.embeddingDimensionsApiPassthrough') ||
+                          'Forward dimensions to API (MRL passthrough)'}
+                      </h4>
                       <p className="text-xs text-gray-500 mt-1">
-                        {t('settings.embeddingProviderPresetDescription') ||
-                          'Choose a provider to prefill its OpenAI-compatible endpoint and model.'}
+                        {t('settings.embeddingDimensionsApiPassthroughDescription') ||
+                          'Only models known to support Matryoshka (MRL) receive the dimensions parameter. Enable this to force it for other MRL-capable models. Non-MRL models (Qwen3-Embedding, BGE, vLLM/sglang) reject the parameter outright, so leave this off for them.'}
                       </p>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <select
-                        value={tempSmartRoutingConfig.embeddingProviderPreset}
-                        onChange={(e) =>
-                          handleEmbeddingProviderPresetChange(
-                            e.target.value as EmbeddingProviderPresetId,
-                          )
-                        }
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 bg-white dark:bg-gray-800 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
-                        disabled={loading}
-                      >
-                        <option value="openai">
-                          {t('settings.embeddingProviderPresetOpenai') || 'OpenAI'}
-                        </option>
-                        <option value="openrouter">
-                          {t('settings.embeddingProviderPresetOpenrouter') || 'OpenRouter'}
-                        </option>
-                        <option value="siliconflow">
-                          {t('settings.embeddingProviderPresetSiliconflow') ||
-                            'SiliconFlow · free tier'}
-                        </option>
-                        <option value="gemini">
-                          {t('settings.embeddingProviderPresetGemini') ||
-                            'Google Gemini · free tier'}
-                        </option>
-                        <option value="custom">
-                          {t('settings.embeddingProviderPresetCustom') ||
-                            'Other / OpenAI-compatible'}
-                        </option>
-                      </select>
-                    </div>
+                    <Switch
+                      disabled={loading || !smartRoutingConfig.enabled}
+                      checked={smartRoutingConfig.embeddingDimensionsApiPassthrough}
+                      onCheckedChange={(checked) =>
+                        updateSmartRoutingConfig('embeddingDimensionsApiPassthrough', checked)
+                      }
+                    />
                   </div>
+                </div>
 
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.llmProviderApiKey')}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="password"
-                        value={tempSmartRoutingConfig.llmProviderApiKey}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange('llmProviderApiKey', e.target.value)
-                        }
-                        placeholder={t('settings.llmProviderApiKeyPlaceholder')}
-                        className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300"
-                        disabled={loading}
-                      />
-                    </div>
-                    {renderEnvOverrideWarning('llmProviderApiKey')}
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">{t('settings.basePacingDelayMs')}</h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.basePacingDelayMsDescription')}
+                    </p>
                   </div>
-
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.llmProviderBaseUrl')}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={tempSmartRoutingConfig.llmProviderBaseUrl}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange('llmProviderBaseUrl', e.target.value)
-                        }
-                        placeholder={t('settings.llmProviderBaseUrlPlaceholder')}
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                        disabled={loading}
-                        required
-                      />
-                    </div>
-                    {renderEnvOverrideWarning('llmProviderBaseUrl')}
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min="0"
+                      step="1000"
+                      value={tempSmartRoutingConfig.basePacingDelayMs}
+                      onChange={(e) =>
+                        handleSmartRoutingConfigChange('basePacingDelayMs', e.target.value)
+                      }
+                      placeholder={
+                        t('settings.basePacingDelayMsPlaceholder') || 'Empty = default 0 ms'
+                      }
+                      className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                      disabled={loading}
+                    />
                   </div>
-
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.embeddingModel')}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={tempSmartRoutingConfig.embeddingModel}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange('embeddingModel', e.target.value)
-                        }
-                        placeholder={t('settings.embeddingModelPlaceholder')}
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                        disabled={loading}
-                        required
-                      />
-                    </div>
-                    {renderEnvOverrideWarning('embeddingModel')}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.azureOpenaiEndpoint') || 'Azure OpenAI Endpoint'}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={tempSmartRoutingConfig.azureOpenaiEndpoint}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange('azureOpenaiEndpoint', e.target.value)
-                        }
-                        placeholder={
-                          t('settings.azureOpenaiEndpointPlaceholder') ||
-                          'https://YOUR_RESOURCE_NAME.openai.azure.com'
-                        }
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                        disabled={loading}
-                      />
-                    </div>
-                    {renderEnvOverrideWarning('azureOpenaiEndpoint')}
-                  </div>
-
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.azureOpenaiApiKey') || 'Azure OpenAI API Key'}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="password"
-                        value={tempSmartRoutingConfig.azureOpenaiApiKey}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange('azureOpenaiApiKey', e.target.value)
-                        }
-                        placeholder={t('settings.azureOpenaiApiKeyPlaceholder') || '***'}
-                        className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300"
-                        disabled={loading}
-                      />
-                    </div>
-                    {renderEnvOverrideWarning('azureOpenaiApiKey')}
-                  </div>
-
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.azureOpenaiApiVersion') || 'Azure OpenAI API Version'}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={tempSmartRoutingConfig.azureOpenaiApiVersion}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange('azureOpenaiApiVersion', e.target.value)
-                        }
-                        placeholder={
-                          t('settings.azureOpenaiApiVersionPlaceholder') || '2024-02-15-preview'
-                        }
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                        disabled={loading}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.azureOpenaiEmbeddingDeployment') ||
-                          'Azure Embedding Deployment'}
-                      </h3>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={tempSmartRoutingConfig.azureOpenaiEmbeddingDeployment}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange(
-                            'azureOpenaiEmbeddingDeployment',
-                            e.target.value,
-                          )
-                        }
-                        placeholder={
-                          t('settings.azureOpenaiEmbeddingDeploymentPlaceholder') ||
-                          'your-embedding-deployment-name'
-                        }
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                        disabled={loading}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                    <div className="mb-2">
-                      <h3 className="font-medium text-gray-700">
-                        <span className="text-red-500 px-1">*</span>
-                        {t('settings.azureOpenaiEmbeddingModel') || 'Azure Embedding Model Name'}
-                      </h3>
-                      <p className="text-xs text-gray-500 mt-1">
-                        {t('settings.azureOpenaiEmbeddingModelDescription') ||
-                          'The actual OpenAI model name deployed in Azure (e.g. text-embedding-3-small). Used for accurate token counting.'}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={tempSmartRoutingConfig.azureOpenaiEmbeddingModel}
-                        onChange={(e) =>
-                          handleSmartRoutingConfigChange(
-                            'azureOpenaiEmbeddingModel',
-                            e.target.value,
-                          )
-                        }
-                        placeholder={
-                          t('settings.azureOpenaiEmbeddingModelPlaceholder') ||
-                          'text-embedding-3-small'
-                        }
-                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                        disabled={loading}
-                        required
-                      />
-                    </div>
-                  </div>
-                </>
-              )}
-
-              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                <div className="mb-2">
-                  <h3 className="font-medium text-gray-700">
-                    {t('settings.embeddingDimensions') || 'Embedding Dimensions'}
-                  </h3>
-                  <p className="text-xs text-gray-500 mt-1">
-                    {t('settings.embeddingDimensionsDescription') ||
-                      "Optional output size for providers that support it. Leave empty to use the model's default."}
+                  <p className="text-xs text-gray-500 mt-2">
+                    {(() => {
+                      const trimmedValue = tempSmartRoutingConfig.basePacingDelayMs.trim();
+                      if (!trimmedValue) {
+                        return t('settings.basePacingDelayMsAuto', { value: 0 });
+                      }
+                      if (trimmedValue === '0') {
+                        return t('settings.basePacingDelayMsZero');
+                      }
+                      return t('settings.basePacingDelayMsOverride');
+                    })()}
                   </p>
                 </div>
-                <div className="flex items-center gap-3">
+
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">
+                      {t('settings.embeddingEncodingFormat')}
+                    </h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.embeddingEncodingFormatDescription')}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <select
+                      value={tempSmartRoutingConfig.embeddingEncodingFormat}
+                      onChange={(e) =>
+                        handleSmartRoutingConfigChange(
+                          'embeddingEncodingFormat',
+                          e.target.value as 'auto' | 'base64' | 'float',
+                        )
+                      }
+                      className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
+                      disabled={loading}
+                    >
+                      <option value="auto">
+                        {t('settings.embeddingEncodingFormatAuto') || 'Auto'}
+                      </option>
+                      <option value="base64">Base64</option>
+                      <option value="float">Float</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">
+                      {t('settings.embeddingMaxTokens')}
+                    </h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.embeddingMaxTokensDescription')}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min="1"
+                      value={tempSmartRoutingConfig.embeddingMaxTokens}
+                      onChange={(e) =>
+                        handleSmartRoutingConfigChange('embeddingMaxTokens', e.target.value)
+                      }
+                      placeholder={
+                        t('settings.embeddingMaxTokensPlaceholder') || 'Empty = auto by model'
+                      }
+                      className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                      disabled={loading}
+                    />
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">
+                    {(() => {
+                      const embeddingModelName =
+                        (tempSmartRoutingConfig.embeddingProvider === 'azure_openai'
+                          ? tempSmartRoutingConfig.azureOpenaiEmbeddingModel ||
+                            smartRoutingConfig.azureOpenaiEmbeddingModel
+                          : tempSmartRoutingConfig.embeddingModel ||
+                            smartRoutingConfig.embeddingModel) || 'text-embedding-3-small';
+
+                      return tempSmartRoutingConfig.embeddingMaxTokens.trim()
+                        ? t('settings.embeddingMaxTokensOverride')
+                        : t('settings.embeddingMaxTokensAuto', {
+                            limit: getDefaultTokenLimitForUI(embeddingModelName),
+                            model: embeddingModelName,
+                          });
+                    })()}
+                  </p>
+                </div>
+
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">{t('settings.embeddingPrefixes')}</h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.embeddingPrefixesDescription')}
+                    </p>
+                  </div>
+                  <label
+                    htmlFor="embeddingQueryPrefix"
+                    className="block text-xs text-gray-600 mt-2"
+                  >
+                    {t('settings.embeddingQueryPrefix')}
+                  </label>
                   <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    value={tempSmartRoutingConfig.embeddingDimensions}
+                    id="embeddingQueryPrefix"
+                    type="text"
+                    value={tempSmartRoutingConfig.embeddingQueryPrefix}
                     onChange={(e) =>
-                      handleSmartRoutingConfigChange('embeddingDimensions', e.target.value)
+                      handleSmartRoutingConfigChange('embeddingQueryPrefix', e.target.value)
                     }
-                    placeholder={
-                      t('settings.embeddingDimensionsPlaceholder') || 'Empty = model default'
-                    }
-                    className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                    placeholder="task: search result | query: "
+                    className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input font-mono"
                     disabled={loading}
                   />
+                  {renderEnvOverrideWarning('embeddingQueryPrefix')}
+                  <label
+                    htmlFor="embeddingDocumentPrefix"
+                    className="block text-xs text-gray-600 mt-3"
+                  >
+                    {t('settings.embeddingDocumentPrefix')}
+                  </label>
+                  <input
+                    id="embeddingDocumentPrefix"
+                    type="text"
+                    value={tempSmartRoutingConfig.embeddingDocumentPrefix}
+                    onChange={(e) =>
+                      handleSmartRoutingConfigChange('embeddingDocumentPrefix', e.target.value)
+                    }
+                    placeholder="title: none | text: "
+                    className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input font-mono"
+                    disabled={loading}
+                  />
+                  {renderEnvOverrideWarning('embeddingDocumentPrefix')}
                 </div>
-                <div className="flex items-center justify-between mt-3">
-                  <div>
-                    <h4 className="font-medium text-gray-700">
-                      {t('settings.embeddingDimensionsApiPassthrough') ||
-                        'Forward dimensions to API (MRL passthrough)'}
-                    </h4>
+
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">{t('settings.searchResults')}</h3>
                     <p className="text-xs text-gray-500 mt-1">
-                      {t('settings.embeddingDimensionsApiPassthroughDescription') ||
-                        "Only models known to support Matryoshka (MRL) receive the dimensions parameter. Enable this to force it for other MRL-capable models. Non-MRL models (Qwen3-Embedding, BGE, vLLM/sglang) reject the parameter outright, so leave this off for them."}
+                      {t('settings.searchResultsDescription')}
+                    </p>
+                  </div>
+                  <label htmlFor="similarityThreshold" className="block text-xs text-gray-600 mt-2">
+                    {t('settings.similarityThreshold')}
+                  </label>
+                  <input
+                    id="similarityThreshold"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={tempSmartRoutingConfig.similarityThreshold}
+                    onChange={(e) =>
+                      handleSmartRoutingConfigChange('similarityThreshold', e.target.value)
+                    }
+                    placeholder={t('settings.similarityThresholdPlaceholder')}
+                    className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                    disabled={loading}
+                  />
+                  {renderEnvOverrideWarning('similarityThreshold')}
+                  <label htmlFor="fullSchemaTopN" className="block text-xs text-gray-600 mt-3">
+                    {t('settings.fullSchemaTopN')}
+                  </label>
+                  <input
+                    id="fullSchemaTopN"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={tempSmartRoutingConfig.fullSchemaTopN}
+                    onChange={(e) =>
+                      handleSmartRoutingConfigChange('fullSchemaTopN', e.target.value)
+                    }
+                    placeholder={t('settings.fullSchemaTopNPlaceholder')}
+                    className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                    disabled={loading}
+                  />
+                  {renderEnvOverrideWarning('fullSchemaTopN')}
+                  <p className="block text-xs text-gray-600 mt-3">
+                    {t('settings.toolDefinitionFields')}
+                  </p>
+                  <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+                    {TOOL_DEFINITION_FIELDS.map((field) => {
+                      const selected =
+                        smartRoutingConfig.toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS;
+                      return (
+                        <label key={field} className="flex items-center gap-1 text-sm font-mono">
+                          <input
+                            type="checkbox"
+                            className="form-checkbox h-4 w-4"
+                            checked={selected.includes(field)}
+                            onChange={(e) =>
+                              updateSmartRoutingConfig(
+                                'toolDefinitionFields',
+                                TOOL_DEFINITION_FIELDS.filter((name) =>
+                                  name === field ? e.target.checked : selected.includes(name),
+                                ),
+                              )
+                            }
+                            disabled={loading}
+                          />
+                          {field}
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {t('settings.toolDefinitionFieldsDescription')}
+                  </p>
+                  {renderEnvOverrideWarning('toolDefinitionFields')}
+                </div>
+
+                <div
+                  className="flex items-center justify-between"
+                  style={{
+                    padding: '12px 14px',
+                    border: '1px solid var(--hub-line)',
+                    borderRadius: 8,
+                    background: 'var(--hub-bg-2)',
+                  }}
+                >
+                  <div>
+                    <h3 className="font-medium" style={{ color: 'var(--hub-ink)', fontSize: 13 }}>
+                      {t('settings.progressiveDisclosure')}
+                    </h3>
+                    <p style={{ fontSize: 12, color: 'var(--hub-ink-3)' }}>
+                      {t('settings.progressiveDisclosureDescription')}
                     </p>
                   </div>
                   <Switch
                     disabled={loading || !smartRoutingConfig.enabled}
-                    checked={smartRoutingConfig.embeddingDimensionsApiPassthrough}
+                    checked={smartRoutingConfig.progressiveDisclosure}
                     onCheckedChange={(checked) =>
-                      updateSmartRoutingConfig('embeddingDimensionsApiPassthrough', checked)
+                      updateSmartRoutingConfig('progressiveDisclosure', checked)
                     }
                   />
                 </div>
+                {/* end space-y-3 fields wrapper */}
               </div>
-
-              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                <div className="mb-2">
-                  <h3 className="font-medium text-gray-700">
-                    {t('settings.basePacingDelayMs')}
-                  </h3>
-                  <p className="text-xs text-gray-500 mt-1">
-                    {t('settings.basePacingDelayMsDescription')}
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    min="0"
-                    step="1000"
-                    value={tempSmartRoutingConfig.basePacingDelayMs}
-                    onChange={(e) =>
-                      handleSmartRoutingConfigChange('basePacingDelayMs', e.target.value)
-                    }
-                    placeholder={
-                      t('settings.basePacingDelayMsPlaceholder') || 'Empty = default 0 ms'
-                    }
-                    className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                    disabled={loading}
-                  />
-                </div>
-                <p className="text-xs text-gray-500 mt-2">
-                  {(() => {
-                    const trimmedValue = tempSmartRoutingConfig.basePacingDelayMs.trim();
-                    if (!trimmedValue) {
-                      return t('settings.basePacingDelayMsAuto', { value: 0 });
-                    }
-                    if (trimmedValue === '0') {
-                      return t('settings.basePacingDelayMsZero');
-                    }
-                    return t('settings.basePacingDelayMsOverride');
-                  })()}
-                </p>
-
-
-              </div>
-
-              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                <div className="mb-2">
-                  <h3 className="font-medium text-gray-700">
-                    {t('settings.embeddingEncodingFormat')}
-                  </h3>
-                  <p className="text-xs text-gray-500 mt-1">
-                    {t('settings.embeddingEncodingFormatDescription')}
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <select
-                    value={tempSmartRoutingConfig.embeddingEncodingFormat}
-                    onChange={(e) =>
-                      handleSmartRoutingConfigChange(
-                        'embeddingEncodingFormat',
-                        e.target.value as 'auto' | 'base64' | 'float',
-                      )
-                    }
-                    className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
-                    disabled={loading}
-                  >
-                    <option value="auto">
-                      {t('settings.embeddingEncodingFormatAuto') || 'Auto'}
-                    </option>
-                    <option value="base64">Base64</option>
-                    <option value="float">Float</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
-                <div className="mb-2">
-                  <h3 className="font-medium text-gray-700">
-                    {t('settings.embeddingMaxTokens')}
-                  </h3>
-                  <p className="text-xs text-gray-500 mt-1">
-                    {t('settings.embeddingMaxTokensDescription')}
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    min="1"
-                    value={tempSmartRoutingConfig.embeddingMaxTokens}
-                    onChange={(e) =>
-                      handleSmartRoutingConfigChange('embeddingMaxTokens', e.target.value)
-                    }
-                    placeholder={
-                      t('settings.embeddingMaxTokensPlaceholder') || 'Empty = auto by model'
-                    }
-                    className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
-                    disabled={loading}
-                  />
-                </div>
-                <p className="text-xs text-gray-500 mt-2">
-                  {(() => {
-                    const embeddingModelName =
-                      (tempSmartRoutingConfig.embeddingProvider === 'azure_openai'
-                        ? tempSmartRoutingConfig.azureOpenaiEmbeddingModel ||
-                          smartRoutingConfig.azureOpenaiEmbeddingModel
-                        : tempSmartRoutingConfig.embeddingModel ||
-                          smartRoutingConfig.embeddingModel) ||
-                      'text-embedding-3-small';
-
-                    return tempSmartRoutingConfig.embeddingMaxTokens.trim()
-                      ? t('settings.embeddingMaxTokensOverride')
-                      : t('settings.embeddingMaxTokensAuto', {
-                          limit: getDefaultTokenLimitForUI(embeddingModelName),
-                          model: embeddingModelName,
-                        });
-                  })()}
-                </p>
-              </div>
-              
-              <div
-                className="flex items-center justify-between"
-                style={{
-                  padding: '12px 14px',
-                  border: '1px solid var(--hub-line)',
-                  borderRadius: 8,
-                  background: 'var(--hub-bg-2)',
-                }}
-              >
-                <div>
-                  <h3 className="font-medium" style={{ color: 'var(--hub-ink)', fontSize: 13 }}>
-                    {t('settings.progressiveDisclosure')}
-                  </h3>
-                  <p style={{ fontSize: 12, color: 'var(--hub-ink-3)' }}>
-                    {t('settings.progressiveDisclosureDescription')}
-                  </p>
-                </div>
-                <Switch
-                  disabled={loading || !smartRoutingConfig.enabled}
-                  checked={smartRoutingConfig.progressiveDisclosure}
-                  onCheckedChange={(checked) =>
-                    updateSmartRoutingConfig('progressiveDisclosure', checked)
-                  }
-                />
-              </div>
-              </div> {/* end space-y-3 fields wrapper */}
 
               <div className="flex justify-end pt-3">
                 <button
@@ -3326,6 +3595,24 @@ const SettingsPage: React.FC = () => {
                 />
               </div>
 
+              <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div>
+                  <h3 className="font-medium text-gray-700">
+                    {t('settings.disablePasswordLogin')}
+                  </h3>
+                  <p className="text-sm text-gray-500">
+                    {t('settings.disablePasswordLoginDescription')}
+                  </p>
+                </div>
+                <Switch
+                  disabled={loading}
+                  checked={betterAuthConfig.disablePasswordLogin}
+                  onCheckedChange={(checked) =>
+                    handleBetterAuthToggle({ disablePasswordLogin: checked })
+                  }
+                />
+              </div>
+
               <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                 <div className="mb-2">
                   <h3 className="font-medium text-gray-700">
@@ -3662,6 +3949,31 @@ const SettingsPage: React.FC = () => {
           )}
         </div>
       </PermissionChecker>
+
+      {isAdmin && (
+        <div className="hub-card mb-6 p-5 space-y-3">
+          <label htmlFor="allowed-cidrs" className="block font-medium text-[var(--hub-ink)]">
+            {t('settings.allowedCidrs')}
+          </label>
+          <p className="text-sm text-[var(--hub-ink-2)]">{t('settings.allowedCidrsDescription')}</p>
+          <textarea
+            id="allowed-cidrs"
+            value={tempAllowedCidrs}
+            onChange={(event) => setTempAllowedCidrs(event.target.value)}
+            placeholder={'192.168.1.0/24\nfd00::/64'}
+            rows={4}
+            disabled={loading}
+            className="block w-full py-2 px-3 border border-gray-300 rounded-md form-input font-mono"
+          />
+          <button
+            className="hub-btn primary"
+            disabled={loading}
+            onClick={() => updateAllowedCidrs(tempAllowedCidrs.split(/\s+/).filter(Boolean))}
+          >
+            {t('common.save')}
+          </button>
+        </div>
+      )}
 
       {/* Route Configuration Settings */}
       <PermissionChecker permissions={PERMISSIONS.SETTINGS_ROUTE_CONFIG}>

@@ -9,6 +9,8 @@ MCPHub (`@samanhappy/mcphub`) is a TypeScript/Node.js ESM hub that aggregates MC
 - Do not hand-edit generated output: `dist/`, `frontend/dist/`, or `coverage/`.
 - Read the scoped guide relevant to the files you will change. The full index is in [docs/agents/README.md](docs/agents/README.md).
 - Prefer the `gh` CLI for GitHub operations — reviewing PRs, reading issues, fetching diffs, creating PRs — over scraping the GitHub web UI or hand-calling the REST API. Command details live in [docs/agents/git-and-contribution.md](docs/agents/git-and-contribution.md).
+- The agent shell runs non-interactively with a minimal `PATH`, so bare `gh`, `pnpm`, `node`, and `npx` may report `command not found` even when installed. See [docs/agents/development.md](docs/agents/development.md) ("Agent shell `PATH`") for how to locate and export the toolchain.
+- The agent shell file sandbox denies writes outside the repo, so `npx`/`uvx` cache writes fail with `EPERM` and tests that spawn real MCP servers via `npx` time out. See [docs/agents/development.md](docs/agents/development.md) ("Agent shell file sandbox") for the workaround.
 
 ## Project-specific build checks
 
@@ -29,3 +31,4 @@ MCPHub (`@samanhappy/mcphub`) is a TypeScript/Node.js ESM hub that aggregates MC
 - [Domain documentation](docs/agents/domain.md)
 - [GitHub issue tracker](docs/agents/issue-tracker.md)
 - [Triage labels](docs/agents/triage-labels.md)
+- [Security advisory lifecycle](docs/agents/security-advisories.md)

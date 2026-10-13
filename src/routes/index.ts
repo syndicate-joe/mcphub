@@ -175,7 +175,11 @@ import {
   importConfigTemplate,
 } from '../controllers/templateController.js';
 import { auth } from '../middlewares/auth.js';
-import { getBetterAuthRuntimeConfig } from '../services/betterAuthConfig.js';
+import { requireAdminMiddleware } from '../utils/requireAdmin.js';
+import {
+  getBetterAuthRuntimeConfig,
+  setMountedSsoProviders,
+} from '../services/betterAuthConfig.js';
 import {
   authAttemptRateLimiter,
   authRegistrationRateLimiter,
@@ -196,14 +200,15 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   const betterAuthConfig = await getBetterAuthRuntimeConfig();
 
   if (betterAuthConfig.enabled && !isTestEnv) {
-    const [{ auth: betterAuth, ensureBetterAuthSchema }, { toNodeHandler }] = await Promise.all([
-      import('../betterAuth.js'),
-      import('better-auth/node'),
-    ]);
+    const [
+      { auth: betterAuth, ensureBetterAuthSchema, registeredSsoProviders },
+      { toNodeHandler },
+    ] = await Promise.all([import('../betterAuth.js'), import('better-auth/node')]);
     await ensureBetterAuthSchema();
     const betterAuthPath = `${config.basePath}${betterAuthConfig.basePath}`;
     app.all(`${betterAuthPath}`, toNodeHandler(betterAuth));
     app.all(`${betterAuthPath}/*`, toNodeHandler(betterAuth));
+    setMountedSsoProviders(registeredSsoProviders);
   }
 
   // Health check endpoint (no auth required, accessible at /health)
@@ -398,8 +403,13 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   authenticatedRouter.delete('/resources/:id', deleteBuiltinResource);
   authenticatedRouter.post('/resources/read', readResource);
 
-  // MCPB upload routes
-  authenticatedRouter.post('/mcpb/upload', uploadMiddleware, uploadMcpbFile);
+  // MCPB upload routes. Admin-only: the handler replaces the code at the
+  // deterministic `data/uploads/mcpb/server-<name>` path that existing stdio
+  // server configurations point into, so an unprivileged upload would be a
+  // second write path to the stdio execution boundary (GHSA-xf2m-3c3x-53vp).
+  // The admin gate must run before `uploadMiddleware` so multer never stages a
+  // non-admin upload body on disk.
+  authenticatedRouter.post('/mcpb/upload', requireAdminMiddleware, uploadMiddleware, uploadMcpbFile);
 
   // Market routes
   authenticatedRouter.get('/market/servers', getAllMarketServers);

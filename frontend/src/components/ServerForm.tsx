@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useAuth } from '../contexts/AuthContext';
 import { X } from 'lucide-react';
 import { Server, EnvVar, ServerFormData, OpenApiToolStats } from '@/types';
 import { apiGet, apiPost } from '../utils/fetchInterceptor';
@@ -59,6 +60,7 @@ const ServerForm = ({
   shareCandidatesFrom = null,
 }: ServerFormProps) => {
   const { t } = useTranslation();
+  const { auth } = useAuth();
 
   // Native `pattern`/`maxLength` on the name field are enforced on create and
   // on edit of an already-valid name. Editing a legacy (invalid) name without
@@ -93,6 +95,9 @@ const ServerForm = ({
 
     return {
       clientId: oauth?.clientId || '',
+      ...(oauth?.allowInsecureTokenEndpoint !== undefined && {
+        allowInsecureTokenEndpoint: oauth.allowInsecureTokenEndpoint,
+      }),
       clientSecret: oauth?.clientSecret || '',
       scopes: oauth?.scopes ? oauth.scopes.join(' ') : '',
       accessToken: oauth?.accessToken || '',
@@ -123,12 +128,7 @@ const ServerForm = ({
     description: (initialData && initialData.config && initialData.config.description) || '',
     url: (initialData && initialData.config && initialData.config.url) || '',
     command: (initialData && initialData.config && initialData.config.command) || '',
-    arguments:
-      initialData && initialData.config && initialData.config.args
-        ? Array.isArray(initialData.config.args)
-          ? initialData.config.args.join(' ')
-          : String(initialData.config.args)
-        : '',
+    arguments: '',
     args: (initialData && initialData.config && initialData.config.args) || [],
     type: getInitialServerType(), // Initialize the type field
     env: getInitialServerEnvVars(initialData),
@@ -137,6 +137,7 @@ const ServerForm = ({
     visibility: (initialData?.config?.visibility ?? 'private') as 'private' | 'group' | 'public',
     sharedWithUsers: initialData?.config?.sharedWithUsers || [],
     options: {
+      maxBufferSize: initialData?.config?.options?.maxBufferSize,
       timeout:
         (initialData &&
           initialData.config &&
@@ -363,12 +364,6 @@ const ServerForm = ({
     setFormData({ ...formData, [name]: value });
   };
 
-  // Transform space-separated arguments string into array
-  const handleArgsChange = (value: string) => {
-    const args = value.split(' ').filter((arg) => arg.trim() !== '');
-    setFormData({ ...formData, arguments: value, args });
-  };
-
   const updateServerType = (type: 'stdio' | 'sse' | 'streamable-http' | 'openapi') => {
     setServerType(type);
     setFormData((prev) => ({ ...prev, type }));
@@ -408,7 +403,7 @@ const ServerForm = ({
 
   const handleOAuthChange = <K extends keyof NonNullable<ServerFormData['oauth']>>(
     field: K,
-    value: string,
+    value: NonNullable<ServerFormData['oauth']>[K],
   ) => {
     setFormData((prev) => ({
       ...prev,
@@ -421,7 +416,7 @@ const ServerForm = ({
 
   // Handle options changes
   const handleOptionsChange = (
-    field: 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout',
+    field: 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout' | 'maxBufferSize',
     value: number | boolean | undefined,
   ) => {
     setFormData((prev) => ({
@@ -1640,21 +1635,51 @@ const ServerForm = ({
                   />
                 </div>
                 <div className="mb-4">
-                  <label
-                    className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300"
-                    htmlFor="arguments"
-                  >
-                    {t('server.arguments')}
-                  </label>
-                  <input
-                    type="text"
-                    name="arguments"
-                    id="arguments"
-                    value={formData.arguments}
-                    onChange={(e) => handleArgsChange(e.target.value)}
-                    className="w-full py-2 px-3 form-input"
-                    placeholder="e.g.: -y time-mcp"
-                  />
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {t('server.arguments')}
+                    </span>
+                    <button
+                      type="button"
+                      className="text-sm text-blue-600 dark:text-blue-400"
+                      onClick={() =>
+                        setFormData((prev) => ({ ...prev, args: [...(prev.args || []), ''] }))
+                      }
+                    >
+                      {t('server.addArgument')}
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-2">{t('server.argumentsHint')}</p>
+                  {(formData.args || []).map((arg, index) => (
+                    <div key={index} className="flex items-center gap-2 mb-2">
+                      <input
+                        type="text"
+                        aria-label={t('server.argumentLabel', { index: index + 1 })}
+                        value={arg}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          setFormData((prev) => ({
+                            ...prev,
+                            args: prev.args?.map((item, i) => (i === index ? value : item)),
+                          }));
+                        }}
+                        className="w-full py-2 px-3 form-input"
+                      />
+                      <button
+                        type="button"
+                        aria-label={t('server.removeArgument', { index: index + 1 })}
+                        onClick={() =>
+                          setFormData((prev) => ({
+                            ...prev,
+                            args: prev.args?.filter((_, i) => i !== index),
+                          }))
+                        }
+                        className="text-gray-500 hover:text-red-600"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
                 </div>
 
                 <div className="mb-4">
@@ -1721,11 +1746,35 @@ const ServerForm = ({
               <fieldset className="space-y-3 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
                 <legend className="px-1 font-medium">{t('credentials.slots')}</legend>
                 <p className="text-sm text-gray-500">{t('credentials.slotsHint')}</p>
+                {serverType === 'stdio' && (
+                  <p className="text-sm text-gray-500">
+                    {t('credentials.argsHint', { placeholder: '{{args.API_KEY}}' })}
+                  </p>
+                )}
                 {(formData.credentialTemplate || []).map((slot, index) => (
                   <div key={index} className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm">
-                      {t(serverType === 'stdio' ? 'server.envVars' : 'server.headers')}
-                    </span>
+                    {serverType === 'stdio' ? (
+                      <select
+                        aria-label={t('credentials.target')}
+                        value={slot.target === 'args' ? 'args' : 'env'}
+                        className="py-2 px-3 form-input"
+                        onChange={(event) =>
+                          setFormData({
+                            ...formData,
+                            credentialTemplate: formData.credentialTemplate?.map((item, i) =>
+                              i === index
+                                ? { ...item, target: event.target.value as 'env' | 'args' }
+                                : item,
+                            ),
+                          })
+                        }
+                      >
+                        <option value="env">{t('server.envVars')}</option>
+                        <option value="args">{t('server.arguments')}</option>
+                      </select>
+                    ) : (
+                      <span className="text-sm">{t('server.headers')}</span>
+                    )}
                     <input
                       required
                       maxLength={128}
@@ -1994,6 +2043,25 @@ const ServerForm = ({
                       <p className="text-xs text-gray-500 mb-3">
                         {t('server.oauth.sectionDescription')}
                       </p>
+                      {(serverType === 'sse' || serverType === 'streamable-http') &&
+                        (auth.user?.isAdmin || formData.oauth?.allowInsecureTokenEndpoint) && (
+                          <div className="mb-3">
+                            <label className="flex items-center gap-2 text-sm">
+                              <input
+                                type="checkbox"
+                                checked={formData.oauth?.allowInsecureTokenEndpoint === true}
+                                disabled={!auth.user?.isAdmin}
+                                onChange={(e) =>
+                                  handleOAuthChange('allowInsecureTokenEndpoint', e.target.checked)
+                                }
+                              />
+                              {t('server.oauth.allowInsecureTokenEndpoint')}
+                            </label>
+                            <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
+                              {t('server.oauth.allowInsecureTokenEndpointHelp')}
+                            </p>
+                          </div>
+                        )}
                       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                         <div>
                           <label className="block text-xs text-gray-600 mb-1">
@@ -2045,6 +2113,34 @@ const ServerForm = ({
                   {isRequestOptionsExpanded && (
                     <div className="border border-gray-200 dark:border-gray-700 rounded-b p-4 bg-gray-50 dark:bg-gray-800 border-t-0">
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {serverType === 'stdio' && (
+                          <div>
+                            <label
+                              className="block text-gray-600 text-sm font-medium mb-1"
+                              htmlFor="maxBufferSize"
+                            >
+                              {t('server.maxBufferSize')}
+                            </label>
+                            <input
+                              type="number"
+                              id="maxBufferSize"
+                              value={formData.options?.maxBufferSize ?? ''}
+                              onChange={(e) =>
+                                handleOptionsChange(
+                                  'maxBufferSize',
+                                  e.target.value === '' ? undefined : Number(e.target.value),
+                                )
+                              }
+                              className="w-full py-2 px-3 form-input"
+                              placeholder="10485760"
+                              min="1"
+                              step="1"
+                            />
+                            <p className="text-xs text-gray-500 mt-1">
+                              {t('server.maxBufferSizeDescription')}
+                            </p>
+                          </div>
+                        )}
                         <div>
                           <label
                             className="block text-gray-600 text-sm font-medium mb-1"

@@ -12,9 +12,11 @@
 export interface AuthorizationResponseIssContext {
   /** `iss` query parameter from the authorization response (absent on legacy servers). */
   iss?: string;
+  /** Support advertised by the AS when this authorization flow started. */
+  issRequired?: boolean;
   /** The authorization URL MCPHub originally redirected the user to. */
   authorizationUrl?: string;
-  /** Explicitly configured issuer for the upstream server, if any. */
+  /** Discovered or explicitly configured issuer for this flow, if any. */
   configuredIssuer?: string;
 }
 
@@ -36,28 +38,35 @@ const originOf = (url: string | undefined): string | undefined => {
 
 /**
  * Expected `iss` values for an upstream authorization flow: the explicitly
- * configured issuer plus the origin of the authorization endpoint actually used.
+ * configured issuer, falling back to the authorization endpoint origin.
  */
 export const expectedIssValues = (ctx: AuthorizationResponseIssContext): string[] => {
-  const candidates = [ctx.configuredIssuer, originOf(ctx.authorizationUrl)];
-  return [...new Set(candidates.filter((c): c is string => Boolean(c)))];
+  const issuer = ctx.configuredIssuer || originOf(ctx.authorizationUrl);
+  return issuer ? [issuer] : [];
 };
 
 /**
  * Validate the `iss` authorization-response parameter.
  *
- * - Absent `iss` → valid but unchecked (older servers do not send it).
- * - Present `iss` with nothing to compare against → unchecked fail-safe pass,
- *   since we cannot establish what the client expected (no mix-up possible
- *   when only one AS is involved in a flow keyed by our own state parameter).
- * - Present `iss` → must exactly match one of the expected values.
+ * Missing `iss` is allowed for servers known not to advertise RFC 9207 support.
+ * Older pending flows without a support snapshot retain the strict policy.
+ * A supplied issuer must match the complete expected issuer; the endpoint
+ * origin is only a fallback when no issuer was discovered or configured.
  */
 export const validateAuthorizationIss = (
   ctx: AuthorizationResponseIssContext,
 ): IssValidationResult => {
   const { iss } = ctx;
 
-  if (!iss) {
+  if (iss === undefined) {
+    const expected = expectedIssValues(ctx);
+    if (ctx.issRequired === true || (ctx.issRequired === undefined && expected.length > 0)) {
+      return {
+        valid: false,
+        checked: true,
+        reason: 'iss parameter is missing from the authorization response',
+      };
+    }
     return { valid: true, checked: false };
   }
 

@@ -2,6 +2,11 @@ import { expandEnvVars } from '../config/index.js';
 import { getSystemConfigDao } from '../dao/DaoFactory.js';
 import { migrateLegacySmartRoutingConfig } from '../dao/SystemConfigDao.js';
 import { logger } from './logger.js';
+import {
+  DEFAULT_TOOL_DEFINITION_FIELDS,
+  TOOL_DEFINITION_FIELDS,
+  type ToolDefinitionField,
+} from '../constants/smartRoutingDefaults.js';
 
 /**
  * Smart routing configuration interface
@@ -71,6 +76,37 @@ export interface SmartRoutingConfig {
    * Useful for local inference servers with a batch_size lower than the model's official limit.
    */
   embeddingMaxTokens?: number;
+  /**
+   * Text prepended to the search query before it is embedded. Asymmetric retrieval models
+   * are trained with task prefixes, e.g. EmbeddingGemma expects "task: search result | query: ".
+   * Default: '' (the raw query is embedded, as before).
+   */
+  embeddingQueryPrefix?: string;
+  /**
+   * Text prepended to each tool and server document before it is embedded, e.g.
+   * "title: none | text: " for EmbeddingGemma. Changing it re-embeds every server.
+   * Default: '' (existing embeddings stay valid).
+   */
+  embeddingDocumentPrefix?: string;
+  /**
+   * Minimum cosine similarity (0-1) a tool must reach to be returned by search_tools.
+   * Default: unset, which keeps the query-length heuristic (0.2 for short queries,
+   * 0.4 for long or "specific"/"exact" ones, 0.3 otherwise).
+   */
+  similarityThreshold?: number;
+  /**
+   * Number of top search_tools hits that carry their full tool definition
+   * (inputSchema and the rest). Lower-ranked hits only carry name, description
+   * and score, and describe_tool is exposed to fetch their schema.
+   * Ignored in progressive disclosure mode. Default: unset (every hit is full).
+   */
+  fullSchemaTopN?: number;
+  /**
+   * Optional tool fields that search_tools hits and describe_tool include next
+   * to name, description, inputSchema and serverName. An empty list sends only
+   * those. Default: DEFAULT_TOOL_DEFINITION_FIELDS (title, annotations).
+   */
+  toolDefinitionFields?: readonly ToolDefinitionField[];
   /**
    * Fields whose effective value currently comes from an environment variable
    * instead of the persisted (dashboard) setting.
@@ -343,6 +379,63 @@ export async function getSmartRoutingConfig(): Promise<SmartRoutingConfig> {
       },
     ),
 
+    // Task prefixes for asymmetric embedding models. Kept verbatim (no trim):
+    // the trailing space is part of the prefix.
+    embeddingQueryPrefix: cfg(
+      'embeddingQueryPrefix',
+      { SMART_ROUTING_EMBEDDING_QUERY_PREFIX: process.env.SMART_ROUTING_EMBEDDING_QUERY_PREFIX },
+      smartRoutingSettings.embeddingQueryPrefix,
+      '',
+      String,
+    ),
+    embeddingDocumentPrefix: cfg(
+      'embeddingDocumentPrefix',
+      {
+        SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX: process.env.SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX,
+      },
+      smartRoutingSettings.embeddingDocumentPrefix,
+      '',
+      String,
+    ),
+
+    // Unset (undefined) keeps the per-query heuristic in handleSearchToolsRequest
+    similarityThreshold: cfg<number | undefined>(
+      'similarityThreshold',
+      { SMART_ROUTING_SIMILARITY_THRESHOLD: process.env.SMART_ROUTING_SIMILARITY_THRESHOLD },
+      smartRoutingSettings.similarityThreshold,
+      undefined,
+      parseSimilarityThreshold,
+    ),
+
+    // Unset (undefined) returns the full definition for every hit
+    fullSchemaTopN: cfg<number | undefined>(
+      'fullSchemaTopN',
+      { SMART_ROUTING_FULL_SCHEMA_TOP_N: process.env.SMART_ROUTING_FULL_SCHEMA_TOP_N },
+      smartRoutingSettings.fullSchemaTopN,
+      undefined,
+      parseFullSchemaTopN,
+    ),
+
+    // An invalid value throws, so resolveConfigValue logs it and falls through
+    // to the next source instead of silently dropping fields
+    toolDefinitionFields: cfg<readonly ToolDefinitionField[]>(
+      'toolDefinitionFields',
+      {
+        SMART_ROUTING_TOOL_DEFINITION_FIELDS: process.env.SMART_ROUTING_TOOL_DEFINITION_FIELDS,
+      },
+      smartRoutingSettings.toolDefinitionFields,
+      DEFAULT_TOOL_DEFINITION_FIELDS,
+      (value: unknown) => {
+        const fields = parseToolDefinitionFields(value);
+        if (!fields) {
+          throw new Error(
+            `toolDefinitionFields must list only ${TOOL_DEFINITION_FIELDS.join(', ')} (or be "none")`,
+          );
+        }
+        return fields;
+      },
+    ),
+
     envOverriddenFields,
   };
 }
@@ -399,6 +492,60 @@ function resolveConfigValue<T>(
 
   // Return default value
   return { value: defaultValue, source: 'default' };
+}
+
+/**
+ * A number as given, or a non-blank numeric string (env vars). Anything else,
+ * including booleans and arrays that Number() would coerce, is not a value.
+ */
+function toSettingNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return value;
+  }
+  return typeof value === 'string' && value.trim() !== '' ? Number(value) : undefined;
+}
+
+/**
+ * Parses a similarity threshold. Anything that is not a number in [0, 1]
+ * yields undefined, i.e. "use the default heuristic".
+ */
+export function parseSimilarityThreshold(value: unknown): number | undefined {
+  const parsed = toSettingNumber(value);
+  return parsed !== undefined && Number.isFinite(parsed) && parsed >= 0 && parsed <= 1
+    ? parsed
+    : undefined;
+}
+
+/**
+ * Parses the number of search hits that keep their full tool definition.
+ * Anything that is not a non-negative integer yields undefined, i.e. "all".
+ */
+export function parseFullSchemaTopN(value: unknown): number | undefined {
+  const parsed = toSettingNumber(value);
+  return parsed !== undefined && Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * Parses the optional tool fields for search results: an array of field names,
+ * or a comma-separated string (env vars), where "none" means an empty list.
+ * Returns them deduplicated in TOOL_DEFINITION_FIELDS order, or undefined when
+ * the value is not a list or names an unknown field.
+ */
+export function parseToolDefinitionFields(value: unknown): ToolDefinitionField[] | undefined {
+  let names: unknown[];
+  if (Array.isArray(value)) {
+    names = value;
+  } else if (typeof value === 'string') {
+    names = value.trim().toLowerCase() === 'none' ? [] : value.split(',').map((n) => n.trim());
+    names = names.filter((name) => name !== '');
+  } else {
+    return undefined;
+  }
+  const known: readonly string[] = TOOL_DEFINITION_FIELDS;
+  if (!names.every((name) => typeof name === 'string' && known.includes(name))) {
+    return undefined;
+  }
+  return TOOL_DEFINITION_FIELDS.filter((field) => names.includes(field));
 }
 
 /**

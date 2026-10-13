@@ -62,6 +62,8 @@ const mockUpdateServerInfoVisibility = jest.fn();
 const mockGetServersInfo = jest.fn();
 const mockGetCurrentUser = jest.fn();
 const mockDisconnectUpstreamOAuth = jest.fn();
+const mockDeleteCredentialBindings = jest.fn();
+const mockCopyCredentialBindings = jest.fn();
 
 jest.mock('../../src/dao/DaoFactory.js', () => ({
   getCredentialBindingDao: jest.fn(() => ({ delete: jest.fn().mockResolvedValue(undefined) })),
@@ -103,12 +105,24 @@ jest.mock('../../src/services/vectorSearchService.js', () => ({
   ),
 }));
 
+// Tool and prompt toggles are keyed by `<server><separator><item>`; pin the separator
+jest.mock('../../src/config/index.js', () => ({
+  ...(jest.requireActual('../../src/config/index.js') as object),
+  getNameSeparator: jest.fn(() => '::'),
+}));
+
 jest.mock('../../src/services/userContextService.js', () => ({
   UserContextService: {
     getInstance: jest.fn(() => ({
       getCurrentUser: mockGetCurrentUser,
     })),
   },
+}));
+
+jest.mock('../../src/services/credentialBindingService.js', () => ({
+  ...(jest.requireActual('../../src/services/credentialBindingService.js') as object),
+  deleteCredentialBindings: jest.fn((...args: unknown[]) => mockDeleteCredentialBindings(...args)),
+  copyCredentialBindings: jest.fn((...args: unknown[]) => mockCopyCredentialBindings(...args)),
 }));
 
 jest.mock('../../src/services/upstreamOAuthDisconnectService.js', () => ({
@@ -368,6 +382,64 @@ describe('serverController - server name charset validation', () => {
     type: 'sse',
     url: 'http://localhost:3001/mcp',
   };
+
+  it.each([0, -1, 1.5, NaN, Infinity, null, '1024'])(
+    'rejects invalid buffer limits with HTTP 400 on create/update: %s',
+    async (maxBufferSize) => {
+      for (const handler of [createServer, updateServer]) {
+        const { status, json, response } = createResponse();
+        const request = {
+          params: { name: 'big' },
+          body: {
+            name: 'big',
+            config: { type: 'stdio', command: 'node', options: { maxBufferSize } },
+          },
+          user: adminUser,
+        } as unknown as Request;
+        await handler(request, response);
+        expect(status).toHaveBeenCalledWith(400);
+        expect(json).toHaveBeenCalledWith({
+          success: false,
+          message: 'options.maxBufferSize must be a positive safe integer in bytes',
+        });
+      }
+      expect(mockAddServer).not.toHaveBeenCalled();
+      expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects an invalid batch buffer limit without rejecting valid siblings', async () => {
+    const { json, status, response } = createResponse();
+    await batchCreateServers(
+      {
+        body: {
+          servers: [
+            {
+              name: 'valid',
+              config: { type: 'stdio', command: 'node', options: { maxBufferSize: 16777216 } },
+            },
+            {
+              name: 'invalid',
+              config: { type: 'stdio', command: 'node', options: { maxBufferSize: 0 } },
+            },
+          ],
+        },
+        user: adminUser,
+      } as unknown as Request,
+      response,
+    );
+    expect(status).toHaveBeenCalledWith(207);
+    expect(mockAddServer).toHaveBeenCalledTimes(1);
+    expect(mockAddServer).toHaveBeenCalledWith(
+      'valid',
+      expect.objectContaining({ options: { maxBufferSize: 16777216 } }),
+    );
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ successCount: 1, failureCount: 1 }),
+      }),
+    );
+  });
 
   it('rejects a server name containing spaces on create', async () => {
     const { json, status, response } = createResponse();
@@ -762,6 +834,26 @@ describe('serverController - updateSystemConfig', () => {
     mockSystemConfigDao.update.mockResolvedValue(true);
   });
 
+  it('saves and clears an admin CIDR allowlist', async () => {
+    for (const allowedCidrs of [['192.168.1.0/24', 'fd00::/64'], []]) {
+      mockRequest.body = { network: { allowedCidrs } };
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+      expect(mockSystemConfigDao.update).toHaveBeenLastCalledWith(
+        expect.objectContaining({ network: { allowedCidrs } }),
+      );
+    }
+  });
+
+  it.each([null, {}, { allowedCidrs: '192.168.1.0/24' }, { allowedCidrs: ['192.168.1.0/33'] }])(
+    'rejects invalid network configuration %s without saving',
+    async (network) => {
+      mockRequest.body = { network, routing: { skipAuth: true } };
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockSystemConfigDao.update).not.toHaveBeenCalled();
+    },
+  );
+
   it('rejects system configuration updates from non-admin users', async () => {
     mockRequest.user = {
       username: 'regular-user',
@@ -944,6 +1036,154 @@ describe('serverController - updateSystemConfig', () => {
     expect(mockSyncAllServerToolsEmbeddings).toHaveBeenCalled();
   });
 
+  describe('embedding task prefixes', () => {
+    beforeEach(() => {
+      mockSyncAllServerToolsEmbeddings.mockResolvedValue(undefined);
+      mockSystemConfigDao.get.mockResolvedValue({
+        routing: {},
+        smartRouting: {
+          enabled: true,
+          dbUrl: 'postgres://localhost/test',
+          embeddingProvider: 'openai',
+          embeddingModel: 'embeddinggemma',
+        },
+      });
+    });
+
+    it('persists both prefixes verbatim, keeping the trailing space', async () => {
+      mockRequest.body = {
+        smartRouting: {
+          embeddingQueryPrefix: 'task: search result | query: ',
+          embeddingDocumentPrefix: 'title: none | text: ',
+        },
+      };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockSystemConfigDao.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          smartRouting: expect.objectContaining({
+            embeddingQueryPrefix: 'task: search result | query: ',
+            embeddingDocumentPrefix: 'title: none | text: ',
+          }),
+        }),
+      );
+    });
+
+    it('re-syncs embeddings when the document prefix changes', async () => {
+      mockRequest.body = { smartRouting: { embeddingDocumentPrefix: 'title: none | text: ' } };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockSyncAllServerToolsEmbeddings).toHaveBeenCalled();
+    });
+
+    it('does not re-sync embeddings for a query prefix change', async () => {
+      mockRequest.body = {
+        smartRouting: { embeddingQueryPrefix: 'task: search result | query: ' },
+      };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockSystemConfigDao.update).toHaveBeenCalled();
+      expect(mockSyncAllServerToolsEmbeddings).not.toHaveBeenCalled();
+    });
+
+    it('does not re-sync when clearing a document prefix that was never set', async () => {
+      mockRequest.body = { smartRouting: { embeddingDocumentPrefix: '' } };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockSyncAllServerToolsEmbeddings).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('search result settings', () => {
+    beforeEach(() => {
+      mockSyncAllServerToolsEmbeddings.mockResolvedValue(undefined);
+      mockSystemConfigDao.get.mockResolvedValue({
+        routing: {},
+        smartRouting: {
+          enabled: true,
+          dbUrl: 'postgres://localhost/test',
+          embeddingProvider: 'openai',
+          embeddingModel: 'embeddinggemma',
+          similarityThreshold: 0.5,
+          fullSchemaTopN: 2,
+        },
+      });
+    });
+
+    it('persists the threshold and top-N without re-syncing embeddings', async () => {
+      mockRequest.body = { smartRouting: { similarityThreshold: 0.35, fullSchemaTopN: 0 } };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockSystemConfigDao.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          smartRouting: expect.objectContaining({ similarityThreshold: 0.35, fullSchemaTopN: 0 }),
+        }),
+      );
+      expect(mockSyncAllServerToolsEmbeddings).not.toHaveBeenCalled();
+    });
+
+    it('clears both back to the defaults with null', async () => {
+      mockRequest.body = { smartRouting: { similarityThreshold: null, fullSchemaTopN: null } };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      const saved = (mockSystemConfigDao.update as jest.Mock).mock.calls[0][0] as any;
+      expect(saved.smartRouting.similarityThreshold).toBeUndefined();
+      expect(saved.smartRouting.fullSchemaTopN).toBeUndefined();
+    });
+
+    it('persists the tool definition fields in result order without re-syncing', async () => {
+      mockRequest.body = { smartRouting: { toolDefinitionFields: ['icons', 'title'] } };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockSystemConfigDao.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          smartRouting: expect.objectContaining({ toolDefinitionFields: ['title', 'icons'] }),
+        }),
+      );
+      expect(mockSyncAllServerToolsEmbeddings).not.toHaveBeenCalled();
+    });
+
+    it('persists an empty tool definition field list and clears it with null', async () => {
+      mockRequest.body = { smartRouting: { toolDefinitionFields: [] } };
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+      let saved = (mockSystemConfigDao.update as jest.Mock).mock.calls[0][0] as any;
+      expect(saved.smartRouting.toolDefinitionFields).toEqual([]);
+
+      mockRequest.body = { smartRouting: { toolDefinitionFields: null } };
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+      saved = (mockSystemConfigDao.update as jest.Mock).mock.calls[1][0] as any;
+      expect(saved.smartRouting.toolDefinitionFields).toBeUndefined();
+    });
+
+    it.each([
+      [{ similarityThreshold: 1.2 }, 'similarityThreshold'],
+      [{ similarityThreshold: 'high' }, 'similarityThreshold'],
+      [{ fullSchemaTopN: -1 }, 'fullSchemaTopN'],
+      [{ fullSchemaTopN: 1.5 }, 'fullSchemaTopN'],
+      [{ similarityThreshold: true }, 'similarityThreshold'],
+      [{ fullSchemaTopN: [3] }, 'fullSchemaTopN'],
+      [{ toolDefinitionFields: ['inputSchema'] }, 'toolDefinitionFields'],
+      [{ toolDefinitionFields: 'title' }, 'toolDefinitionFields'],
+    ])('rejects an invalid value %j with 400 and saves nothing', async (smartRouting, field) => {
+      mockRequest.body = { smartRouting };
+
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringContaining(field) }),
+      );
+      expect(mockSystemConfigDao.update).not.toHaveBeenCalled();
+    });
+  });
+
   it('normalizes legacy smart-routing request fields before persisting the update', async () => {
     mockRequest.body = {
       smartRouting: {
@@ -1108,6 +1348,29 @@ describe('serverController - updateSystemConfig', () => {
         auth: expect.objectContaining({
           betterAuth: expect.objectContaining({
             baseUrl: 'https://mcp.example.com',
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('persists a disablePasswordLogin-only Better Auth update', async () => {
+    mockRequest.body = { auth: { betterAuth: { disablePasswordLogin: true } } };
+    mockSystemConfigDao.get.mockResolvedValue({
+      routing: { skipAuth: false },
+      auth: { betterAuth: { enabled: true, disableAutoCreate: true } },
+    });
+
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+
+    expect(mockStatus).not.toHaveBeenCalledWith(400);
+    expect(mockSystemConfigDao.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth: expect.objectContaining({
+          betterAuth: expect.objectContaining({
+            enabled: true,
+            disableAutoCreate: true,
+            disablePasswordLogin: true,
           }),
         }),
       }),
@@ -1481,7 +1744,11 @@ describe('serverController - updateServer', () => {
     await updateServer(mockRequest as Request, mockResponse as Response);
 
     expect(mockServerDao.update).toHaveBeenCalled();
-    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'private', undefined);
+    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith(
+      'test-server',
+      'private',
+      undefined,
+    );
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
     expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
     expect(mockNotifyToolChanged).not.toHaveBeenCalled();
@@ -1604,11 +1871,22 @@ describe('serverController - updateServer', () => {
       mockBearerKeyDao.updateServerName.mockResolvedValue(undefined);
       mockAddOrUpdateServer.mockResolvedValue({ success: true });
       mockRemoveServerToolEmbeddings.mockResolvedValue(undefined);
+      // The runtime's cached tool list, named `<server><separator><upstream name>`
+      mockGetServerByName.mockReturnValue({
+        name: 'test-server',
+        tools: ['delete_note', 'list_notes', 'search_notes'].map((tool) => ({
+          name: `test-server::${tool}`,
+        })),
+      });
 
       mockRequest.body = {
         ...mockRequest.body,
         newName: 'renamed-server',
       };
+    });
+
+    afterEach(() => {
+      mockGetServerByName.mockReset();
     });
 
     it('updates every reference to the old name, including vector embeddings', async () => {
@@ -1632,6 +1910,189 @@ describe('serverController - updateServer', () => {
       expect(mockJson).toHaveBeenCalledWith({
         success: true,
         message: 'Server renamed and updated successfully',
+      });
+    });
+
+    it('moves prefixed tool and prompt toggles to the new name', async () => {
+      mockRequest.body.config = {
+        ...mockRequest.body.config,
+        tools: {
+          'test-server::delete_note': { enabled: false },
+          'test-server::list_notes': { enabled: true, description: 'Custom description' },
+          // Bare keys do not depend on the server name
+          search_notes: { enabled: false },
+        },
+        prompts: { 'test-server::summarize': { enabled: false } },
+      };
+
+      await updateServer(mockRequest as Request, mockResponse as Response);
+
+      const [, savedConfig] = mockAddOrUpdateServer.mock.calls[0] as [string, any, boolean];
+      expect(savedConfig.tools).toEqual({
+        'renamed-server::delete_note': { enabled: false },
+        'renamed-server::list_notes': { enabled: true, description: 'Custom description' },
+        search_notes: { enabled: false },
+      });
+      expect(savedConfig.prompts).toEqual({ 'renamed-server::summarize': { enabled: false } });
+    });
+
+    it('moves the stored toggles when the request does not send them', async () => {
+      // Without them the update merge would keep the stored map, old keys and all
+      mockServerDao.findById.mockResolvedValue({
+        name: 'test-server',
+        type: 'sse',
+        url: 'https://example.com/sse',
+        enabled: true,
+        owner: 'admin',
+        visibility: 'private',
+        tools: { 'test-server::delete_note': { enabled: false } },
+        prompts: { 'test-server::summarize': { enabled: false } },
+      });
+
+      await updateServer(mockRequest as Request, mockResponse as Response);
+
+      const [, savedConfig] = mockAddOrUpdateServer.mock.calls[0] as [string, any, boolean];
+      expect(savedConfig.tools).toEqual({ 'renamed-server::delete_note': { enabled: false } });
+      expect(savedConfig.prompts).toEqual({ 'renamed-server::summarize': { enabled: false } });
+    });
+
+    it('keeps the toggle that was in effect when both prefixes are present', async () => {
+      mockRequest.body.config = {
+        ...mockRequest.body.config,
+        tools: {
+          // Left over from an earlier server of that name; it never matched anything
+          'renamed-server::delete_note': { enabled: true },
+          'test-server::delete_note': { enabled: false },
+        },
+      };
+
+      await updateServer(mockRequest as Request, mockResponse as Response);
+
+      const [, savedConfig] = mockAddOrUpdateServer.mock.calls[0] as [string, any, boolean];
+      expect(savedConfig.tools).toEqual({ 'renamed-server::delete_note': { enabled: false } });
+    });
+
+    it('keeps a bare key that is itself an upstream tool name starting with the server prefix', async () => {
+      // An upstream tool literally named 'test-server::delete_note' is cached as
+      // 'test-server::test-server::delete_note'; its bare toggle must survive
+      mockGetServerByName.mockReturnValue({
+        name: 'test-server',
+        tools: [{ name: 'test-server::test-server::delete_note' }],
+      });
+      mockRequest.body.config = {
+        ...mockRequest.body.config,
+        tools: { 'test-server::delete_note': { enabled: false } },
+      };
+
+      await updateServer(mockRequest as Request, mockResponse as Response);
+
+      const [, savedConfig] = mockAddOrUpdateServer.mock.calls[0] as [string, any, boolean];
+      expect(savedConfig.tools).toEqual({
+        // the bare key, still matching the upstream tool of that name
+        'test-server::delete_note': { enabled: false },
+        // and the prefixed meaning of the same key, moved to the new name
+        'renamed-server::delete_note': { enabled: false },
+      });
+    });
+
+    it('keeps old-prefix tool keys next to their moved copy while the tool list is unknown', async () => {
+      mockGetServerByName.mockReturnValue(undefined);
+      mockRequest.body.config = {
+        ...mockRequest.body.config,
+        tools: { 'test-server::delete_note': { enabled: false } },
+        prompts: { 'test-server::summarize': { enabled: false } },
+      };
+
+      await updateServer(mockRequest as Request, mockResponse as Response);
+
+      const [, savedConfig] = mockAddOrUpdateServer.mock.calls[0] as [string, any, boolean];
+      expect(savedConfig.tools).toEqual({
+        'test-server::delete_note': { enabled: false },
+        'renamed-server::delete_note': { enabled: false },
+      });
+      // Prompt lookups never accept bare names, so prompt keys are always moved
+      expect(savedConfig.prompts).toEqual({ 'renamed-server::summarize': { enabled: false } });
+    });
+
+    it('adds no tools or prompts maps to a server that has none', async () => {
+      await updateServer(mockRequest as Request, mockResponse as Response);
+
+      const [, savedConfig] = mockAddOrUpdateServer.mock.calls[0] as [string, any, boolean];
+      expect(savedConfig).not.toHaveProperty('tools');
+      expect(savedConfig).not.toHaveProperty('prompts');
+    });
+
+    describe('with personal credential bindings', () => {
+      const credentialServer = {
+        type: 'streamable-http',
+        url: 'https://example.com/mcp',
+        enabled: true,
+        owner: 'admin',
+        visibility: 'public',
+        credentialTemplate: [{ target: 'headers', name: 'Authorization' }],
+      };
+
+      beforeEach(() => {
+        mockServerDao.findById.mockResolvedValue({ name: 'test-server', ...credentialServer });
+        mockRequest.body.config = { ...credentialServer };
+      });
+
+      it('copies the bindings before the rename and removes the originals after it', async () => {
+        // Database mode reads an unset column back as null
+        mockServerDao.findById.mockResolvedValue({
+          name: 'test-server',
+          ...credentialServer,
+          proxy: null,
+        });
+        mockRequest.body.config.description = 'Renamed and described';
+
+        await updateServer(mockRequest as Request, mockResponse as Response);
+
+        expect(mockCopyCredentialBindings).toHaveBeenCalledWith('test-server', 'renamed-server');
+        expect(mockDeleteCredentialBindings).toHaveBeenCalledTimes(1);
+        expect(mockDeleteCredentialBindings).toHaveBeenCalledWith({ serverName: 'test-server' });
+        expect(mockCopyCredentialBindings.mock.invocationCallOrder[0]).toBeLessThan(
+          mockServerDao.rename.mock.invocationCallOrder[0],
+        );
+        expect(mockServerDao.rename.mock.invocationCallOrder[0]).toBeLessThan(
+          mockDeleteCredentialBindings.mock.invocationCallOrder[0],
+        );
+      });
+
+      it('leaves the server, its references and the bindings untouched when the copy fails', async () => {
+        mockCopyCredentialBindings.mockRejectedValueOnce(new Error('disk full'));
+
+        await updateServer(mockRequest as Request, mockResponse as Response);
+
+        expect(mockResponse.status).toHaveBeenCalledWith(500);
+        expect(mockServerDao.rename).not.toHaveBeenCalled();
+        expect(mockGroupDao.updateServerName).not.toHaveBeenCalled();
+        expect(mockBearerKeyDao.updateServerName).not.toHaveBeenCalled();
+        expect(mockDeleteCredentialBindings).not.toHaveBeenCalled();
+        expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
+      });
+
+      it('removes the copies when the server rename itself fails', async () => {
+        mockServerDao.rename.mockRejectedValueOnce(new Error('db unavailable'));
+
+        await updateServer(mockRequest as Request, mockResponse as Response);
+
+        expect(mockResponse.status).toHaveBeenCalledWith(500);
+        expect(mockDeleteCredentialBindings).toHaveBeenCalledTimes(1);
+        expect(mockDeleteCredentialBindings).toHaveBeenCalledWith({ serverName: 'renamed-server' });
+        expect(mockGroupDao.updateServerName).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['the URL', { url: 'https://other.example.com/mcp' }],
+        ['the credential slots', { credentialTemplate: [{ target: 'headers', name: 'X-Key' }] }],
+      ])('drops the bindings when the rename also changes %s', async (_label, change) => {
+        Object.assign(mockRequest.body.config, change);
+
+        await updateServer(mockRequest as Request, mockResponse as Response);
+
+        expect(mockDeleteCredentialBindings).toHaveBeenCalledWith({ serverName: 'test-server' });
+        expect(mockCopyCredentialBindings).not.toHaveBeenCalled();
       });
     });
 
@@ -2605,4 +3066,106 @@ describe('serverController - getAllServers OAuth session scrub (#1036)', () => {
       'Failed to connect to https://mcp.example.com/mcp?token=mcphub-runtime-secret',
     );
   });
+});
+
+describe('admin-controlled HTTP OAuth token endpoints (#1292)', () => {
+  const config = {
+    type: 'streamable-http',
+    url: 'http://gitlab.internal.example/api/v4/mcp',
+    oauth: { allowInsecureTokenEndpoint: true },
+  };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAddServer.mockResolvedValue({ success: true });
+    mockAddOrUpdateServer.mockResolvedValue({ success: true });
+    mockNotifyToolChanged.mockResolvedValue(undefined);
+    mockServerDao.findById.mockResolvedValue({
+      name: 'gitlab',
+      owner: 'alice',
+      type: 'streamable-http',
+      url: config.url,
+    });
+  });
+
+  it.each([createServer, updateServer, batchCreateServers])(
+    'rejects non-admin writes through %p',
+    async (handler) => {
+      const status = jest.fn().mockReturnThis();
+      const json = jest.fn();
+      await handler(
+        {
+          params: { name: 'gitlab' },
+          body: { name: 'gitlab', config, servers: [{ name: 'gitlab', config }] },
+          user: { username: 'alice', isAdmin: false },
+        } as unknown as Request,
+        { status, json } as unknown as Response,
+      );
+      expect(mockAddServer).not.toHaveBeenCalled();
+      expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
+      if (handler === batchCreateServers) {
+        expect(json).toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ failureCount: 1 }) }),
+        );
+      } else {
+        expect(status).toHaveBeenCalledWith(403);
+      }
+    },
+  );
+
+  it.each([createServer, updateServer, batchCreateServers])(
+    'accepts admin writes through %p',
+    async (handler) => {
+      const status = jest.fn().mockReturnThis();
+      await handler(
+        {
+          params: { name: 'gitlab' },
+          body: { name: 'gitlab', config, servers: [{ name: 'gitlab', config }] },
+          user: { username: 'admin', isAdmin: true },
+        } as unknown as Request,
+        { status, json: jest.fn() } as unknown as Response,
+      );
+      const write = handler === updateServer ? mockAddOrUpdateServer : mockAddServer;
+      expect(write.mock.calls[0].slice(0, 2)).toEqual([
+        'gitlab',
+        expect.objectContaining({ oauth: { allowInsecureTokenEndpoint: true } }),
+      ]);
+      expect(status).not.toHaveBeenCalledWith(403);
+    },
+  );
+
+  it('prevents the owner from changing the target or removing an existing admin exception', async () => {
+    mockServerDao.findById.mockResolvedValue({ name: 'gitlab', owner: 'alice', ...config });
+    const status = jest.fn().mockReturnThis();
+    await updateServer(
+      {
+        params: { name: 'gitlab' },
+        body: { config: { type: 'streamable-http', url: 'http://another.example/mcp' } },
+        user: { username: 'alice', isAdmin: false },
+      } as unknown as Request,
+      { status, json: jest.fn() } as unknown as Response,
+    );
+    expect(status).toHaveBeenCalledWith(403);
+    expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it.each([createServer, updateServer])(
+    'rejects a non-boolean flag through %p',
+    async (handler) => {
+      const status = jest.fn().mockReturnThis();
+      await handler(
+        {
+          params: { name: 'gitlab' },
+          body: {
+            name: 'gitlab',
+            config: { ...config, oauth: { allowInsecureTokenEndpoint: 'true' } },
+          },
+          user: { username: 'admin', isAdmin: true },
+        } as unknown as Request,
+        { status, json: jest.fn() } as unknown as Response,
+      );
+      expect(status).toHaveBeenCalledWith(400);
+      expect(mockAddServer).not.toHaveBeenCalled();
+      expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
+    },
+  );
 });

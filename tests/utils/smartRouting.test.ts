@@ -5,7 +5,12 @@ jest.mock('../../src/dao/DaoFactory.js', () => ({
   getSystemConfigDao: jest.fn(() => ({ get: mockGet, update: mockUpdate })),
 }));
 
-import { getSmartRoutingConfig } from '../../src/utils/smartRouting.js';
+import {
+  getSmartRoutingConfig,
+  parseFullSchemaTopN,
+  parseSimilarityThreshold,
+  parseToolDefinitionFields,
+} from '../../src/utils/smartRouting.js';
 
 // List of every smart-routing-related env var this suite manipulates. We delete
 // them all in beforeEach so global setup (tests/setup.ts sets DB_URL, etc.) does
@@ -30,6 +35,11 @@ const SMART_ROUTING_ENV_VARS = [
   'AZURE_OPENAI_EMBEDDING_MODEL',
   'SMART_ROUTING_PROGRESSIVE_DISCLOSURE',
   'SMART_ROUTING_SERVER_DESCRIPTION_MODE',
+  'SMART_ROUTING_EMBEDDING_QUERY_PREFIX',
+  'SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX',
+  'SMART_ROUTING_SIMILARITY_THRESHOLD',
+  'SMART_ROUTING_FULL_SCHEMA_TOP_N',
+  'SMART_ROUTING_TOOL_DEFINITION_FIELDS',
   'EMBEDDING_MAX_TOKENS',
 ];
 
@@ -308,6 +318,11 @@ describe('smartRouting config resolution', () => {
         progressiveDisclosure: false,
         serverDescriptionMode: 'names',
         embeddingMaxTokens: undefined,
+        embeddingQueryPrefix: '',
+        embeddingDocumentPrefix: '',
+        similarityThreshold: undefined,
+        fullSchemaTopN: undefined,
+        toolDefinitionFields: ['title', 'annotations'],
         envOverriddenFields: [],
       });
     });
@@ -487,6 +502,92 @@ describe('smartRouting config resolution', () => {
         expect(config.embeddingMaxTokens).toBeUndefined();
       });
     });
+
+    describe('embedding prefixes', () => {
+      it('keeps env prefixes verbatim, including the trailing space', async () => {
+        process.env.SMART_ROUTING_EMBEDDING_QUERY_PREFIX = 'task: search result | query: ';
+        process.env.SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX = 'title: none | text: ';
+        const config = await getSmartRoutingConfig();
+        expect(config.embeddingQueryPrefix).toBe('task: search result | query: ');
+        expect(config.embeddingDocumentPrefix).toBe('title: none | text: ');
+        expect(config.envOverriddenFields).toEqual(
+          expect.arrayContaining([
+            { field: 'embeddingQueryPrefix', envVar: 'SMART_ROUTING_EMBEDDING_QUERY_PREFIX' },
+            { field: 'embeddingDocumentPrefix', envVar: 'SMART_ROUTING_EMBEDDING_DOCUMENT_PREFIX' },
+          ]),
+        );
+      });
+
+      it('reads prefixes from settings when env is absent', async () => {
+        mockGet.mockResolvedValue({
+          smartRouting: { embeddingQueryPrefix: 'query: ', embeddingDocumentPrefix: 'passage: ' },
+        });
+        const config = await getSmartRoutingConfig();
+        expect(config.embeddingQueryPrefix).toBe('query: ');
+        expect(config.embeddingDocumentPrefix).toBe('passage: ');
+      });
+    });
+
+    describe('search result settings', () => {
+      it('reads the threshold and top-N from env and reports the override', async () => {
+        process.env.SMART_ROUTING_SIMILARITY_THRESHOLD = '0.45';
+        process.env.SMART_ROUTING_FULL_SCHEMA_TOP_N = '3';
+        const config = await getSmartRoutingConfig();
+        expect(config.similarityThreshold).toBe(0.45);
+        expect(config.fullSchemaTopN).toBe(3);
+        expect(config.envOverriddenFields).toEqual(
+          expect.arrayContaining([
+            { field: 'similarityThreshold', envVar: 'SMART_ROUTING_SIMILARITY_THRESHOLD' },
+            { field: 'fullSchemaTopN', envVar: 'SMART_ROUTING_FULL_SCHEMA_TOP_N' },
+          ]),
+        );
+      });
+
+      it('reads them from settings when env is absent, 0 included', async () => {
+        mockGet.mockResolvedValue({ smartRouting: { similarityThreshold: 0, fullSchemaTopN: 0 } });
+        const config = await getSmartRoutingConfig();
+        expect(config.similarityThreshold).toBe(0);
+        expect(config.fullSchemaTopN).toBe(0);
+      });
+
+      it('falls back to the defaults for invalid env values', async () => {
+        process.env.SMART_ROUTING_SIMILARITY_THRESHOLD = '1.5';
+        process.env.SMART_ROUTING_FULL_SCHEMA_TOP_N = '-1';
+        const config = await getSmartRoutingConfig();
+        expect(config.similarityThreshold).toBeUndefined();
+        expect(config.fullSchemaTopN).toBeUndefined();
+      });
+
+      it('reads the tool definition fields from env and reports the override', async () => {
+        process.env.SMART_ROUTING_TOOL_DEFINITION_FIELDS = 'outputSchema, title';
+        const config = await getSmartRoutingConfig();
+        expect(config.toolDefinitionFields).toEqual(['title', 'outputSchema']);
+        expect(config.envOverriddenFields).toContainEqual({
+          field: 'toolDefinitionFields',
+          envVar: 'SMART_ROUTING_TOOL_DEFINITION_FIELDS',
+        });
+      });
+
+      it('takes "none" in env as no optional fields', async () => {
+        process.env.SMART_ROUTING_TOOL_DEFINITION_FIELDS = 'none';
+        const config = await getSmartRoutingConfig();
+        expect(config.toolDefinitionFields).toEqual([]);
+      });
+
+      it('reads the tool definition fields from settings, an empty list included', async () => {
+        mockGet.mockResolvedValue({ smartRouting: { toolDefinitionFields: [] } });
+        const config = await getSmartRoutingConfig();
+        expect(config.toolDefinitionFields).toEqual([]);
+      });
+
+      it('skips an invalid env value for the tool definition fields', async () => {
+        process.env.SMART_ROUTING_TOOL_DEFINITION_FIELDS = 'icons,favicon';
+        mockGet.mockResolvedValue({ smartRouting: { toolDefinitionFields: ['icons'] } });
+        const config = await getSmartRoutingConfig();
+        expect(config.toolDefinitionFields).toEqual(['icons']);
+        expect(config.envOverriddenFields).toEqual([]);
+      });
+    });
   });
 
   describe('settings override via mockGet', () => {
@@ -512,5 +613,57 @@ describe('smartRouting config resolution', () => {
       expect(config.enabled).toBe(false);
       expect(config.serverDescriptionMode).toBe('names');
     });
+  });
+});
+
+describe('search result setting parsers', () => {
+  it('accepts a similarity threshold in [0, 1] only', () => {
+    expect(parseSimilarityThreshold('0.4')).toBe(0.4);
+    expect(parseSimilarityThreshold(0)).toBe(0);
+    expect(parseSimilarityThreshold(1)).toBe(1);
+    expect(parseSimilarityThreshold(-0.1)).toBeUndefined();
+    expect(parseSimilarityThreshold(1.1)).toBeUndefined();
+    expect(parseSimilarityThreshold('abc')).toBeUndefined();
+    expect(parseSimilarityThreshold('')).toBeUndefined();
+    expect(parseSimilarityThreshold(null)).toBeUndefined();
+  });
+
+  it('rejects types Number() would coerce', () => {
+    for (const value of [true, false, [0.5], [], {}]) {
+      expect(parseSimilarityThreshold(value)).toBeUndefined();
+      expect(parseFullSchemaTopN(value)).toBeUndefined();
+    }
+  });
+
+  it('accepts a non-negative integer top-N only', () => {
+    expect(parseFullSchemaTopN('3')).toBe(3);
+    expect(parseFullSchemaTopN(0)).toBe(0);
+    expect(parseFullSchemaTopN(2.5)).toBeUndefined();
+    expect(parseFullSchemaTopN(-1)).toBeUndefined();
+    expect(parseFullSchemaTopN('x')).toBeUndefined();
+    expect(parseFullSchemaTopN(' ')).toBeUndefined();
+    expect(parseFullSchemaTopN(undefined)).toBeUndefined();
+  });
+});
+
+describe('parseToolDefinitionFields', () => {
+  it('returns known fields deduplicated, in result order', () => {
+    expect(parseToolDefinitionFields(['_meta', 'title', 'title'])).toEqual(['title', '_meta']);
+    expect(parseToolDefinitionFields(' icons , annotations ')).toEqual(['annotations', 'icons']);
+  });
+
+  it('treats an empty list, "none" and a blank string as no fields', () => {
+    expect(parseToolDefinitionFields([])).toEqual([]);
+    expect(parseToolDefinitionFields('none')).toEqual([]);
+    expect(parseToolDefinitionFields(' ')).toEqual([]);
+  });
+
+  it('rejects unknown fields and non-list values', () => {
+    expect(parseToolDefinitionFields(['title', 'inputSchema'])).toBeUndefined();
+    expect(parseToolDefinitionFields(['Title'])).toBeUndefined();
+    expect(parseToolDefinitionFields([1])).toBeUndefined();
+    for (const value of [null, undefined, true, 3, {}]) {
+      expect(parseToolDefinitionFields(value)).toBeUndefined();
+    }
   });
 });
