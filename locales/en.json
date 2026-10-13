@@ -608,7 +608,11 @@
     "showing": "Showing {{from}}-{{to}} of {{total}} servers",
     "perPage": "Per page",
     "confirmVariablesMessage": "Please ensure these variables are properly defined in your runtime environment. Continue installing server?",
-    "confirmAndInstall": "Confirm and Install"
+    "confirmAndInstall": "Confirm and Install",
+    "viewSkill": "View skill",
+    "skillDescription": "Install this skill in your assistant using its documentation. Skills are not MCP servers.",
+    "viewDocumentation": "View documentation",
+    "directoryDescription": "See the source documentation or the Registry tab for connection options."
   },
   "oauthServer": {
     "authorizeTitle": "Authorize Application",

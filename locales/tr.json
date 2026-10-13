@@ -607,7 +607,11 @@
     "showing": "{{total}} sunucudan {{from}}-{{to}} arası gösteriliyor",
     "perPage": "Sayfa başına",
     "confirmVariablesMessage": "Lütfen bu değişkenlerin çalışma ortamınızda düzgün tanımlandığından emin olun. Sunucu yüklemeye devam edilsin mi?",
-    "confirmAndInstall": "Onayla ve Yükle"
+    "confirmAndInstall": "Onayla ve Yükle",
+    "viewSkill": "Beceriyi görüntüle",
+    "skillDescription": "Bu beceriyi belgelerini izleyerek asistanınıza yükleyin. Beceriler MCP sunucusu değildir.",
+    "viewDocumentation": "Belgeleri görüntüle",
+    "directoryDescription": "Bağlantı seçenekleri için kaynak belgelerine veya Kayıt sekmesine bakın."
   },
   "oauthServer": {
     "authorizeTitle": "Uygulamayı Yetkilendir",

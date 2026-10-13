@@ -14,7 +14,9 @@
     "servers.json",
     "frontend/dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "catalog",
+    "scripts/sync-skills-and-registries.mjs"
   ],
   "scripts": {
     "build": "pnpm backend:build && pnpm frontend:build",
@@ -37,7 +39,9 @@
     "frontend:preview": "cd frontend && vite preview",
     "dev": "concurrently \"pnpm backend:dev\" \"pnpm frontend:dev\"",
     "debug": "concurrently \"pnpm backend:debug\" \"pnpm frontend:dev\"",
-    "prepublishOnly": "npm run build && node scripts/verify-dist.js"
+    "prepublishOnly": "npm run build && node scripts/verify-dist.js",
+    "catalog:sync": "node scripts/sync-skills-and-registries.mjs",
+    "catalog:test": "node --test scripts/sync-skills-and-registries.test.mjs"
   },
   "keywords": [
     "typescript",

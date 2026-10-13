@@ -37,6 +37,7 @@ export interface MarketServerTool {
 }
 
 export interface MarketServer {
+  kind?: 'mcp' | 'skill';
   name: string;
   display_name: string;
   description: string;

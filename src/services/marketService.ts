@@ -1,10 +1,14 @@
 import fs from 'fs';
+import path from 'path';
 import { MarketServer } from '../types/index.js';
 import { getConfigFilePath } from '../utils/path.js';
 import { logger } from '../utils/logger.js';
 
 // Get path to the servers.json file
 export const getServersJsonPath = (): string => {
+  if (process.env.MCPHUB_CATALOG_PATH) return path.resolve(process.env.MCPHUB_CATALOG_PATH);
+  const dataCatalog = path.resolve(process.cwd(), 'data/servers.json');
+  if (fs.existsSync(dataCatalog)) return dataCatalog;
   return getConfigFilePath('servers.json', 'Servers');
 };
 
@@ -14,6 +18,19 @@ export const getMarketServers = (): Record<string, MarketServer> => {
     const serversJsonPath = getServersJsonPath();
     const data = fs.readFileSync(serversJsonPath, 'utf8');
     const serversObj = JSON.parse(data) as Record<string, MarketServer>;
+    const overlayPath = getConfigFilePath('catalog/overrides.json', 'Marketplace overlay');
+    if (fs.existsSync(overlayPath)) {
+      const overlay = JSON.parse(fs.readFileSync(overlayPath, 'utf8')) as {
+        schemaVersion: number;
+        entries: Record<string, MarketServer>;
+        remove: string[];
+      };
+      if (overlay.schemaVersion !== 1 || !overlay.entries || !Array.isArray(overlay.remove)) {
+        throw new Error('Invalid marketplace overlay');
+      }
+      Object.assign(serversObj, overlay.entries);
+      overlay.remove.forEach((name) => delete serversObj[name]);
+    }
 
     // use key as name field
     Object.entries(serversObj).forEach(([key, server]) => {

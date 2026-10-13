@@ -610,7 +610,11 @@
     "showing": "显示 {{from}}-{{to}}/{{total}} 个服务器",
     "perPage": "每页显示",
     "confirmVariablesMessage": "请确保这些变量在运行环境中已正确定义。是否继续安装服务器？",
-    "confirmAndInstall": "确认并安装"
+    "confirmAndInstall": "确认并安装",
+    "viewSkill": "查看技能",
+    "skillDescription": "请按照文档将此技能安装到助手中。技能不是 MCP 服务器。",
+    "viewDocumentation": "查看文档",
+    "directoryDescription": "有关连接选项，请参阅来源文档或注册表选项卡。"
   },
   "oauthServer": {
     "authorizeTitle": "授权应用",

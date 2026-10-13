@@ -45,8 +45,7 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
       };
     } else {
       return {
-        className:
-          'hub-btn primary',
+        className: 'hub-btn primary',
         disabled: false,
         text: t('market.install'),
       };
@@ -80,6 +79,7 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
   };
 
   const handleInstall = () => {
+    if (server.kind === 'skill') return;
     if (!isInstalled) {
       toggleModal();
     }
@@ -131,6 +131,29 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
 
   const buttonProps = getButtonProps();
   const preferredInstallation = getPreferredInstallation();
+
+  if (server.kind === 'skill' || !Object.keys(server.installations || {}).length) {
+    return (
+      <div className="hub-card p-6">
+        <button onClick={onBack} className="hub-btn mb-4">
+          {t('market.backToList')}
+        </button>
+        <h2 className="text-2xl font-semibold mb-3">{server.display_name}</h2>
+        <p className="mb-4">{server.description}</p>
+        <p className="mb-4">
+          {t(server.kind === 'skill' ? 'market.skillDescription' : 'market.directoryDescription')}
+        </p>
+        <a
+          href={server.homepage || server.repository?.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hub-btn primary"
+        >
+          {t(server.kind === 'skill' ? 'market.viewSkill' : 'market.viewDocumentation')}
+        </a>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
@@ -196,7 +219,10 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
         </h3>
         <div className="flex flex-wrap gap-2">
           {server.categories?.map((category, index) => (
-            <span key={`cat-${index}`} className="bg-gray-100 dark:bg-gray-800 text-gray-800 px-3 py-1 rounded">
+            <span
+              key={`cat-${index}`}
+              className="bg-gray-100 dark:bg-gray-800 text-gray-800 px-3 py-1 rounded"
+            >
               {category}
             </span>
           ))}
@@ -248,7 +274,9 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
                       )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      <code className="bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded">{arg.example}</code>
+                      <code className="bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded">
+                        {arg.example}
+                      </code>
                     </td>
                   </tr>
                 ))}
@@ -301,7 +329,9 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
               <div key={index} className="border border-gray-200 dark:border-gray-700 rounded p-4">
                 <h4 className="font-medium mb-2">{example.title}</h4>
                 <p className="text-gray-600 mb-2">{example.description}</p>
-                <pre className="bg-gray-50 dark:bg-gray-800 p-3 rounded text-sm overflow-auto">{example.prompt}</pre>
+                <pre className="bg-gray-50 dark:bg-gray-800 p-3 rounded text-sm overflow-auto">
+                  {example.prompt}
+                </pre>
               </div>
             ))}
           </div>
@@ -383,10 +413,7 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
               >
                 {t('common.cancel')}
               </button>
-              <button
-                onClick={handleConfirmInstall}
-                className="hub-btn primary"
-              >
+              <button onClick={handleConfirmInstall} className="hub-btn primary">
                 {t('market.confirmAndInstall')}
               </button>
             </div>

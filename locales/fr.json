@@ -607,7 +607,11 @@
     "showing": "Affichage de {{from}}-{{to}} sur {{total}} serveurs",
     "perPage": "Par page",
     "confirmVariablesMessage": "Veuillez vous assurer que ces variables sont correctement définies dans votre environnement d'exécution. Continuer l'installation du serveur ?",
-    "confirmAndInstall": "Confirmer et installer"
+    "confirmAndInstall": "Confirmer et installer",
+    "viewSkill": "Voir la compétence",
+    "skillDescription": "Installez cette compétence dans votre assistant en suivant sa documentation. Les compétences ne sont pas des serveurs MCP.",
+    "viewDocumentation": "Voir la documentation",
+    "directoryDescription": "Consultez la documentation source ou l’onglet Registre pour les options de connexion."
   },
   "oauthServer": {
     "authorizeTitle": "Autoriser l'application",
