@@ -22,7 +22,7 @@ export function validateCatalog(catalog) {
     ) {
       throw new Error(`Invalid marketplace entry: ${name}`);
     }
-    if (entry.kind && !['mcp', 'skill'].includes(entry.kind)) {
+    if (entry.kind && !['mcp', 'skill', 'directory'].includes(entry.kind)) {
       throw new Error(`Invalid marketplace kind: ${name}`);
     }
   }

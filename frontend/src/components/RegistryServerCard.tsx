@@ -48,6 +48,15 @@ const RegistryServerCard: React.FC<RegistryServerCardProps> = ({ serverEntry, on
     <div
       className="hub-card flex flex-col cursor-pointer transition-colors h-full overflow-hidden"
       onClick={() => onClick(serverEntry)}
+      role="button"
+      aria-label={t('market.openEntry', { name: server.title || server.name })}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick(serverEntry);
+        }
+      }}
       onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--hub-ink-2)')}
       onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--hub-line)')}
     >
@@ -107,10 +116,7 @@ const RegistryServerCard: React.FC<RegistryServerCardProps> = ({ serverEntry, on
                 </span>
               )}
             </div>
-            <div
-              className="hub-mono truncate"
-              style={{ fontSize: 11, color: 'var(--hub-ink-3)' }}
-            >
+            <div className="hub-mono truncate" style={{ fontSize: 11, color: 'var(--hub-ink-3)' }}>
               {server.name} · v{server.version}
             </div>
           </div>
