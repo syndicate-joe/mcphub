@@ -1,3 +1,4 @@
+import type { MarketplaceKind, MarketplaceProvenance } from '../../../src/utils/marketplace.js';
 // Server status types
 export type ServerStatus = 'connecting' | 'connected' | 'disconnected' | 'oauth_required';
 
@@ -37,7 +38,9 @@ export interface MarketServerTool {
 }
 
 export interface MarketServer {
-  kind?: 'mcp' | 'skill' | 'directory';
+  kind?: MarketplaceKind;
+  provenance?: MarketplaceProvenance;
+  compatibility?: string;
   name: string;
   display_name: string;
   description: string;

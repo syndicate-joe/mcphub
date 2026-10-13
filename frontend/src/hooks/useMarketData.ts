@@ -14,6 +14,7 @@ export const useMarketData = (kind: MarketplaceKind = 'mcp') => {
   const { t } = useTranslation();
   const [catalog, setCatalog] = useState<MarketServer[]>([]);
   const [selectedCategory, setSelectedCategory] = useState('');
+  const [selectedSource, setSelectedSource] = useState('');
   const [selectedTag, setSelectedTag] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -24,17 +25,42 @@ export const useMarketData = (kind: MarketplaceKind = 'mcp') => {
 
   const sectionEntries = useMemo(() => filterMarketplaceEntries(catalog, kind), [catalog, kind]);
   const allServers = useMemo(
-    () => filterMarketplaceEntries(catalog, kind, searchQuery, selectedCategory, selectedTag),
-    [catalog, kind, searchQuery, selectedCategory, selectedTag],
+    () =>
+      filterMarketplaceEntries(
+        catalog,
+        kind,
+        searchQuery,
+        selectedCategory,
+        selectedTag,
+        selectedSource,
+      ),
+    [catalog, kind, searchQuery, selectedCategory, selectedTag, selectedSource],
   );
   const categories = useMemo(
-    () => [...new Set(sectionEntries.flatMap((s) => s.categories || []))].filter(category => sectionEntries.some(entry => !entry.categories?.includes(category))).sort(),
+    () =>
+      [...new Set(sectionEntries.flatMap((s) => s.categories || []))]
+        .filter(
+          (category) => !sectionEntries.some((entry) => entry.provenance?.source === category),
+        )
+        .filter((category) => sectionEntries.some((entry) => !entry.categories?.includes(category)))
+        .sort(),
     [sectionEntries],
   );
   const tags = useMemo(
     () => [...new Set(sectionEntries.flatMap((s) => s.tags || []))].sort(),
     [sectionEntries],
   );
+  const sources = useMemo(
+    () =>
+      [
+        ...new Set(sectionEntries.map((entry) => entry.provenance?.source || '__existing__')),
+      ].sort(),
+    [sectionEntries],
+  );
+  const filterBySource = useCallback((source: string) => {
+    setSelectedSource(source);
+    setPage(1);
+  }, []);
   const sectionCounts = useMemo(() => countMarketplaceKinds(catalog), [catalog]);
   const pagination = useMemo(
     () => paginateMarketplaceEntries(allServers, page, serversPerPage),
@@ -45,6 +71,7 @@ export const useMarketData = (kind: MarketplaceKind = 'mcp') => {
     setSearchQuery('');
     setSelectedCategory('');
     setSelectedTag('');
+    setSelectedSource('');
     setPage(1);
   }, []);
   useEffect(clearFilters, [kind, clearFilters]);
@@ -195,6 +222,9 @@ export const useMarketData = (kind: MarketplaceKind = 'mcp') => {
     allServers,
     sectionEntries,
     sectionCounts,
+    sources,
+    selectedSource,
+    filterBySource,
     categories,
     tags,
     selectedCategory,

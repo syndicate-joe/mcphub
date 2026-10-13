@@ -10,13 +10,18 @@ The backend combines the selected catalog with this overlay. An explicit
 `MCPHUB_CATALOG_PATH` takes priority, then `data/servers.json`, then the bundled
 `servers.json`. Overlay entries win and recorded removals stay removed. The Docker
 build also applies the overlay after its MCPM download. npm distributions include
-the overlay. Upstream's live Official Registry tab remains available.
+the overlay. The live Official Registry source remains available. The bundled imported snapshot
+and curated directory references are merged before fork overrides.
+
+See [SOURCES.md](SOURCES.md) for imported repositories, additional researched
+sources, provenance, and metadata refresh behavior.
 
 ## Refresh
 
 Run from the checkout with Node 20 or later:
 
 ```sh
+pnpm catalog:import
 pnpm catalog:sync --check
 pnpm catalog:sync
 pnpm catalog:sync --mcpm --registry
@@ -38,7 +43,8 @@ reviewed export when changing them.
 
 ## Marketplace sections
 
-The marketplace separates MCP Servers, Agent Skills, and Directory Listings.
+The marketplace separates MCP Servers, Agent Skills, Agents, Workflows, Prompts,
+Instructions, Hooks, Plugins, and Directory Listings.
 Each section has its own search, filters, pagination, cards, and detail view.
 MCP Servers retain the connection form and the live Official Registry source.
 Agent Skills show documentation and reviewed skill commands. Directory Listings

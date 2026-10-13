@@ -1,0 +1,146 @@
+{
+  "source-n8n-templates": {
+    "kind": "directory",
+    "display_name": "n8n Workflow Templates",
+    "description": "Community automation templates for n8n. Browse the template and review its platform and credentials before importing.",
+    "homepage": "https://n8n.io/workflows/",
+    "author": {
+      "name": "n8n"
+    },
+    "compatibility": "n8n",
+    "categories": ["Automation"],
+    "tags": ["n8n", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-dify-marketplace": {
+    "kind": "directory",
+    "display_name": "Dify Marketplace",
+    "description": "Browse Dify plugins and workflow templates. These resources target Dify rather than MCPHub.",
+    "homepage": "https://marketplace.dify.ai/",
+    "author": {
+      "name": "Dify"
+    },
+    "compatibility": "Dify",
+    "categories": ["Automation"],
+    "tags": ["Dify", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-glama-directory": {
+    "kind": "directory",
+    "display_name": "Glama MCP Directory",
+    "description": "Additional MCP server and remote connector discovery. Automated directory imports require an API key and visible Glama attribution.",
+    "homepage": "https://glama.ai/mcp/reference",
+    "author": {
+      "name": "Glama"
+    },
+    "compatibility": "Glama",
+    "categories": ["MCP Directories"],
+    "tags": ["Glama", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-smithery-directory": {
+    "kind": "directory",
+    "display_name": "Smithery Registry",
+    "description": "MCP server discovery and deployment metadata through Smithery. Registry imports require authentication and endpoint validation.",
+    "homepage": "https://www.npmjs.com/package/@smithery/registry",
+    "author": {
+      "name": "Smithery"
+    },
+    "compatibility": "Smithery",
+    "categories": ["MCP Directories"],
+    "tags": ["Smithery", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-skills-sh-api": {
+    "kind": "directory",
+    "display_name": "skills.sh Catalog API",
+    "description": "Skill search, curated listings, and details. The documented API requires Vercel OIDC authentication.",
+    "homepage": "https://www.skills.sh/docs/api",
+    "author": {
+      "name": "skills.sh"
+    },
+    "compatibility": "skills.sh",
+    "categories": ["Skill Directories"],
+    "tags": ["skills.sh", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-skills-hub-ai": {
+    "kind": "directory",
+    "display_name": "Skills Hub",
+    "description": "Searchable skill discovery through the Skills Hub MCP server. Connected search does not automatically mirror its catalog here.",
+    "homepage": "https://skills-hub.ai/mcp-skills",
+    "author": {
+      "name": "Skills Hub"
+    },
+    "compatibility": "Skills Hub",
+    "categories": ["Skill Directories"],
+    "tags": ["Skills Hub", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-awesome-mcp-servers": {
+    "kind": "directory",
+    "display_name": "Awesome MCP Servers",
+    "description": "Community-curated MCP server discovery. Follow each publisher\u2019s documentation to verify connection details.",
+    "homepage": "https://github.com/punkpeye/awesome-mcp-servers",
+    "author": {
+      "name": "GitHub"
+    },
+    "compatibility": "GitHub",
+    "categories": ["MCP Directories"],
+    "tags": ["GitHub", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-docker-mcp-registry": {
+    "kind": "directory",
+    "display_name": "Docker MCP Registry",
+    "description": "Docker\u2019s public MCP catalog definitions and container-based server discovery.",
+    "homepage": "https://github.com/docker/mcp-registry",
+    "author": {
+      "name": "Docker"
+    },
+    "compatibility": "Docker",
+    "categories": ["MCP Directories"],
+    "tags": ["Docker", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  },
+  "source-agent-skills-spec": {
+    "kind": "directory",
+    "display_name": "Agent Skills Specification",
+    "description": "Metadata and packaging specification for portable agent skills, including compatibility and license fields.",
+    "homepage": "https://agentskills.io/specification",
+    "author": {
+      "name": "Agent Skills"
+    },
+    "compatibility": "Agent Skills",
+    "categories": ["Specifications"],
+    "tags": ["Agent Skills", "source"],
+    "installations": {},
+    "arguments": {},
+    "tools": [],
+    "examples": []
+  }
+}

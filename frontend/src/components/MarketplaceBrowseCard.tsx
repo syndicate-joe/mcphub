@@ -1,7 +1,13 @@
-import { BookOpen, Compass, ArrowUpRight } from 'lucide-react';
+import { ArrowUpRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { MarketServer } from '@/types';
-import { getMarketplaceKind, getMarketplaceDisplayName } from '../../../src/utils/marketplace.js';
+import {
+  getMarketplaceKind,
+  getMarketplaceDisplayName,
+  marketplaceSectionKeys,
+} from '../../../src/utils/marketplace.js';
+
+import { marketplaceIcons } from './marketplaceSections';
 
 export default function MarketplaceBrowseCard({
   entry,
@@ -11,21 +17,27 @@ export default function MarketplaceBrowseCard({
   onClick: (entry: MarketServer) => void;
 }) {
   const { t } = useTranslation();
-  const skill = getMarketplaceKind(entry) === 'skill';
-  const Icon = skill ? BookOpen : Compass;
+  const kind = getMarketplaceKind(entry);
+  const skill = kind === 'skill';
+  const Icon = marketplaceIcons[kind];
   return (
     <article className="hub-card flex flex-col overflow-hidden">
       <div className="p-4 flex-1">
         <div className="flex items-center gap-2 mb-3" style={{ color: 'var(--hub-accent)' }}>
           <Icon size={17} aria-hidden="true" />
           <span className="hub-mono text-xs">
-            {t(skill ? 'market.sections.skills' : 'market.sections.directory')}
+            {t(`market.sections.${marketplaceSectionKeys[kind]}`)}
           </span>
         </div>
         <h3 className="font-medium mb-1 break-words">{getMarketplaceDisplayName(entry)}</h3>
         <p className="text-xs mb-3" style={{ color: 'var(--hub-ink-3)' }}>
           {entry.author?.name || t('market.unknown')}
         </p>
+        {entry.provenance && (
+          <p className="text-xs mb-2" style={{ color: 'var(--hub-ink-3)' }}>
+            {entry.provenance.source} · {entry.compatibility}
+          </p>
+        )}
         <p className="text-sm line-clamp-3" style={{ color: 'var(--hub-ink-2)' }}>
           {entry.description}
         </p>

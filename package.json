@@ -16,7 +16,8 @@
     "README.md",
     "LICENSE",
     "catalog",
-    "scripts/sync-skills-and-registries.mjs"
+    "scripts/sync-skills-and-registries.mjs",
+    "scripts/import-marketplace-sources.mjs"
   ],
   "scripts": {
     "build": "pnpm backend:build && pnpm frontend:build",
@@ -41,7 +42,8 @@
     "debug": "concurrently \"pnpm backend:debug\" \"pnpm frontend:dev\"",
     "prepublishOnly": "npm run build && node scripts/verify-dist.js",
     "catalog:sync": "node scripts/sync-skills-and-registries.mjs",
-    "catalog:test": "node --test scripts/sync-skills-and-registries.test.mjs"
+    "catalog:test": "node --test scripts/sync-skills-and-registries.test.mjs scripts/import-marketplace-sources.test.mjs",
+    "catalog:import": "node scripts/import-marketplace-sources.mjs"
   },
   "keywords": [
     "typescript",

@@ -120,3 +120,40 @@ test('invalid input leaves an existing output intact; check is read-only; valid 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('imported resources are merged beneath fork overrides and recorded removals', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mcphub-import-merge-'));
+  try {
+    const options = {
+      base: join(dir, 'base.json'),
+      overlay: join(dir, 'overlay.json'),
+      imported: join(dir, 'imported.json'),
+      directories: join(dir, 'directories.json'),
+      check: true,
+    };
+    await writeFile(options.base, JSON.stringify({ fresh: entry('base') }));
+    await writeFile(options.overlay, JSON.stringify(overlay));
+    await writeFile(
+      options.directories,
+      JSON.stringify({ directory: { ...entry('reference'), kind: 'directory' } }),
+    );
+    await writeFile(
+      options.imported,
+      JSON.stringify({
+        schemaVersion: 1,
+        entries: {
+          custom: entry('imported'),
+          removed: entry('removed'),
+          workflow: { ...entry('workflow'), kind: 'workflow' },
+        },
+      }),
+    );
+    const result = await syncCatalog(options);
+    assert.equal(result.custom.description, 'preserved');
+    assert.equal(result.removed, undefined);
+    assert.equal(result.workflow.kind, 'workflow');
+    assert.equal(result.directory.kind, 'directory');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

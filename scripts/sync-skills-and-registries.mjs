@@ -22,7 +22,20 @@ export function validateCatalog(catalog) {
     ) {
       throw new Error(`Invalid marketplace entry: ${name}`);
     }
-    if (entry.kind && !['mcp', 'skill', 'directory'].includes(entry.kind)) {
+    if (
+      entry.kind &&
+      ![
+        'mcp',
+        'skill',
+        'agent',
+        'workflow',
+        'prompt',
+        'instruction',
+        'hook',
+        'plugin',
+        'directory',
+      ].includes(entry.kind)
+    ) {
       throw new Error(`Invalid marketplace kind: ${name}`);
     }
   }
@@ -109,6 +122,17 @@ export async function syncCatalog(options) {
   } else {
     base = await load(options.base);
   }
+  if (options.directories) {
+    const directories = await load(options.directories);
+    validateCatalog(directories);
+    base = { ...base, ...directories };
+  }
+  if (options.imported) {
+    const snapshot = await load(options.imported);
+    if (snapshot.schemaVersion !== 1) throw new Error('Invalid imported snapshot');
+    validateCatalog(snapshot.entries);
+    base = { ...base, ...snapshot.entries };
+  }
   if (options.registry) base = { ...base, ...(await fetchRegistry()) };
   const skills = options.skills ? await load(options.skills) : {};
   const catalog = mergeCatalogs(base, overlay, skills);
@@ -132,6 +156,8 @@ async function main() {
       overlay: { type: 'string', default: resolve(root, 'catalog/overrides.json') },
       output: { type: 'string', default: resolve(root, 'data/servers.json') },
       skills: { type: 'string' },
+      directories: { type: 'string', default: resolve(root, 'catalog/directories.json') },
+      imported: { type: 'string', default: resolve(root, 'catalog/imported.json') },
       mcpm: { type: 'boolean', default: false },
       registry: { type: 'boolean', default: false },
       check: { type: 'boolean', default: false },
@@ -140,7 +166,7 @@ async function main() {
   });
   if (values.help) {
     console.log(
-      'Usage: node scripts/sync-skills-and-registries.mjs [--mcpm] [--registry] [--base FILE] [--overlay FILE] [--skills FILE] [--output FILE] [--check]',
+      'Usage: node scripts/sync-skills-and-registries.mjs [--mcpm] [--registry] [--base FILE] [--overlay FILE] [--skills FILE] [--imported FILE] [--directories FILE] [--output FILE] [--check]',
     );
     return;
   }

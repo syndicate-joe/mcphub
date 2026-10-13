@@ -1,16 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import {
-  Search,
-  AlertCircle,
-  X,
-  ChevronDown,
-  Network,
-  BookOpen,
-  Compass,
-  ExternalLink,
-} from 'lucide-react';
+import { Search, AlertCircle, X, ChevronDown, ExternalLink } from 'lucide-react';
 import { MarketServer, ServerConfig, RegistryServerEntry, RegistryServerData } from '@/types';
 import { useMarketData } from '@/hooks/useMarketData';
 import { useRegistryData } from '@/hooks/useRegistryData';
@@ -20,7 +11,13 @@ import { slugifyServerName } from '@/utils/serverName';
 import MarketServerCard from '@/components/MarketServerCard';
 import MarketplaceBrowseCard from '@/components/MarketplaceBrowseCard';
 import MarketplaceBrowseDetail from '@/components/MarketplaceBrowseDetail';
-import { getMarketplaceKind, type MarketplaceKind } from '../../../src/utils/marketplace.js';
+import {
+  getMarketplaceKind,
+  marketplaceKinds,
+  marketplaceSectionKeys,
+  type MarketplaceKind,
+} from '../../../src/utils/marketplace.js';
+import { marketplaceIcons } from '@/components/marketplaceSections';
 import MarketServerDetail from '@/components/MarketServerDetail';
 import RegistryServerCard from '@/components/RegistryServerCard';
 import RegistryServerDetail from '@/components/RegistryServerDetail';
@@ -35,8 +32,9 @@ const MarketPage: React.FC = () => {
 
   const [searchParams, setSearchParams] = useSearchParams();
   const sectionParam = searchParams.get('section');
-  const currentSection: MarketplaceKind =
-    sectionParam === 'skill' || sectionParam === 'directory' ? sectionParam : 'mcp';
+  const currentSection: MarketplaceKind = marketplaceKinds.includes(sectionParam as MarketplaceKind)
+    ? (sectionParam as MarketplaceKind)
+    : 'mcp';
   const currentTab: 'local' | 'registry' =
     currentSection === 'mcp' && searchParams.get('tab') === 'registry' ? 'registry' : 'local';
 
@@ -45,6 +43,9 @@ const MarketPage: React.FC = () => {
     allServers: allLocalServers,
     sectionEntries,
     sectionCounts,
+    sources,
+    selectedSource,
+    filterBySource,
     clearFilters: clearLocalFilters,
     categories: localCategories,
     loading: localLoading,
@@ -282,13 +283,12 @@ const MarketPage: React.FC = () => {
   const totalPages = isLocalTab ? localTotalPages : registryTotalPages;
   const serversPerPage = isLocalTab ? localServersPerPage : registryServersPerPage;
 
-  const sections: { id: MarketplaceKind; key: string; icon: typeof Network }[] = [
-    { id: 'mcp', key: 'servers', icon: Network },
-    { id: 'skill', key: 'skills', icon: BookOpen },
-    { id: 'directory', key: 'directory', icon: Compass },
-  ];
-  const sectionKey =
-    currentSection === 'mcp' ? 'servers' : currentSection === 'skill' ? 'skills' : 'directory';
+  const sections = marketplaceKinds.map((id) => ({
+    id,
+    key: marketplaceSectionKeys[id],
+    icon: marketplaceIcons[id],
+  }));
+  const sectionKey = marketplaceSectionKeys[currentSection];
 
   const tabs: {
     id: 'local' | 'registry';
@@ -299,7 +299,7 @@ const MarketPage: React.FC = () => {
     {
       id: 'local',
       label: t('market.curatedSource'),
-      sourceLabel: 'MCPM',
+      sourceLabel: t('market.curatedSource'),
       sourceUrl: 'https://mcpm.sh',
     },
     {
@@ -322,14 +322,14 @@ const MarketPage: React.FC = () => {
 
       <nav
         aria-label={t('market.sections.navigation')}
-        className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6"
+        className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2 mb-6"
       >
         {sections.map(({ id, key, icon: Icon }) => (
           <button
             key={id}
             onClick={() => switchSection(id)}
             aria-pressed={currentSection === id}
-            className="hub-card text-left p-4 transition-colors"
+            className="hub-card text-left p-3 transition-colors min-w-0"
             style={{
               borderColor: currentSection === id ? 'var(--hub-accent)' : 'var(--hub-line)',
               background: currentSection === id ? 'var(--hub-accent-soft)' : 'var(--hub-surface)',
@@ -340,12 +340,6 @@ const MarketPage: React.FC = () => {
               <span className="hub-mono text-sm">{localLoading ? '—' : sectionCounts[id]}</span>
             </span>
             <span className="block font-medium">{t(`market.sections.${key}`)}</span>
-            <span
-              className="block text-xs mt-1 leading-relaxed"
-              style={{ color: 'var(--hub-ink-2)' }}
-            >
-              {t(`market.sections.${key}Description`)}
-            </span>
           </button>
         ))}
       </nav>
@@ -383,11 +377,26 @@ const MarketPage: React.FC = () => {
       )}
 
       {currentSection !== 'mcp' && (
-        <p className="hub-sub mb-5">
-          {t(
-            currentSection === 'skill' ? 'market.skillDescription' : 'market.directoryDescription',
-          )}
-        </p>
+        <p className="hub-sub mb-5">{t(`market.sections.${sectionKey}Usage`)}</p>
+      )}
+
+      {currentTab === 'local' && sources.length > 1 && (
+        <label className="flex flex-wrap items-center gap-3 text-sm mb-4">
+          {t('market.filterSource')}
+          <select
+            aria-label={t('market.filterSource')}
+            value={selectedSource}
+            onChange={(event) => filterBySource(event.target.value)}
+            className="hub-input max-w-full"
+          >
+            <option value="">{t('market.allSources')}</option>
+            {sources.map((source) => (
+              <option key={source} value={source}>
+                {source === '__existing__' ? t('market.recoveredSource') : source}
+              </option>
+            ))}
+          </select>
+        </label>
       )}
 
       {error && (
@@ -438,7 +447,7 @@ const MarketPage: React.FC = () => {
           <button type="submit" className="hub-btn">
             {t('common.search')}
           </button>
-          {((isLocalTab && (searchQuery || selectedCategory || selectedTag)) ||
+          {((isLocalTab && (searchQuery || selectedCategory || selectedTag || selectedSource)) ||
             (isRegistryTab && registrySearchQuery)) && (
             <button type="button" onClick={handleClearFilters} className="hub-btn ghost">
               {t('common.clear')}

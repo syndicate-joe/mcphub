@@ -1,8 +1,14 @@
 import { useState } from 'react';
-import { BookOpen, Compass, ArrowLeft, ExternalLink, Copy, Check } from 'lucide-react';
+import { ArrowLeft, ExternalLink, Copy, Check } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { MarketServer } from '@/types';
-import { getMarketplaceKind, getMarketplaceDisplayName } from '../../../src/utils/marketplace.js';
+import {
+  getMarketplaceKind,
+  getMarketplaceDisplayName,
+  marketplaceSectionKeys,
+} from '../../../src/utils/marketplace.js';
+
+import { marketplaceIcons } from './marketplaceSections';
 
 export default function MarketplaceBrowseDetail({
   entry,
@@ -14,8 +20,10 @@ export default function MarketplaceBrowseDetail({
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
-  const skill = getMarketplaceKind(entry) === 'skill';
-  const Icon = skill ? BookOpen : Compass;
+  const kind = getMarketplaceKind(entry);
+  const skill = kind === 'skill';
+  const key = marketplaceSectionKeys[kind];
+  const Icon = marketplaceIcons[kind];
   const candidate = entry.homepage || entry.repository?.url;
   const source = candidate && /^https?:\/\//i.test(candidate) ? candidate : undefined;
   const args = entry.installations?.npm?.args;
@@ -48,9 +56,7 @@ export default function MarketplaceBrowseDetail({
       <div className="hub-card p-5 sm:p-7">
         <div className="flex items-center gap-2 mb-4" style={{ color: 'var(--hub-accent)' }}>
           <Icon size={20} aria-hidden="true" />
-          <span className="hub-mono">
-            {t(skill ? 'market.sections.skills' : 'market.sections.directory')}
-          </span>
+          <span className="hub-mono">{t(`market.sections.${key}`)}</span>
         </div>
         <h1 className="hub-h1 break-words">{getMarketplaceDisplayName(entry)}</h1>
         <p className="hub-sub mt-2">{entry.author?.name || t('market.unknown')}</p>
@@ -64,12 +70,49 @@ export default function MarketplaceBrowseDetail({
             </span>
           ))}
         </div>
+        {(entry.provenance || entry.compatibility || entry.license) && (
+          <dl className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6 text-sm">
+            {entry.compatibility && (
+              <div>
+                <dt className="hub-sub">{t('market.compatibility')}</dt>
+                <dd>{entry.compatibility}</dd>
+              </div>
+            )}
+            {entry.license && (
+              <div>
+                <dt className="hub-sub">{t('market.license')}</dt>
+                <dd className="break-words">{entry.license}</dd>
+              </div>
+            )}
+            {entry.provenance && (
+              <>
+                <div>
+                  <dt className="hub-sub">{t('market.sourceLabel')}</dt>
+                  <dd>{entry.provenance.source}</dd>
+                </div>
+                <div>
+                  <dt className="hub-sub">{t('market.importedAt')}</dt>
+                  <dd>{entry.provenance.fetchedAt.slice(0, 10)}</dd>
+                </div>
+                <div className="sm:col-span-2">
+                  <dt className="hub-sub">{t('market.sourceRevision')}</dt>
+                  <dd className="hub-mono break-all">
+                    {entry.provenance.repo} · {entry.provenance.revision.slice(0, 12)}
+                    <br />
+                    {entry.provenance.path}
+                  </dd>
+                </div>
+              </>
+            )}
+          </dl>
+        )}
+        {!!entry.provenance?.metadataWarnings?.length && (
+          <p className="hub-sub mb-4">{t('market.metadataReview')}</p>
+        )}
         <div className="rounded-lg p-4 mb-5" style={{ background: 'var(--hub-bg-2)' }}>
-          <h2 className="font-medium mb-2">
-            {t(skill ? 'market.skillUsageTitle' : 'market.directoryUsageTitle')}
-          </h2>
+          <h2 className="font-medium mb-2">{t('market.resourceUsageTitle')}</h2>
           <p className="text-sm" style={{ color: 'var(--hub-ink-2)' }}>
-            {t(skill ? 'market.skillDescription' : 'market.directoryDescription')}
+            {t(`market.sections.${key}Usage`)}
           </p>
           {command && (
             <div className="flex flex-col sm:flex-row gap-3 mt-4">
