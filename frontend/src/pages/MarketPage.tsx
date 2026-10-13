@@ -1,19 +1,26 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Search, AlertCircle, X, ChevronDown } from 'lucide-react';
 import {
-  MarketServer,
-  ServerConfig,
-  RegistryServerEntry,
-  RegistryServerData,
-} from '@/types';
+  Search,
+  AlertCircle,
+  X,
+  ChevronDown,
+  Network,
+  BookOpen,
+  Compass,
+  ExternalLink,
+} from 'lucide-react';
+import { MarketServer, ServerConfig, RegistryServerEntry, RegistryServerData } from '@/types';
 import { useMarketData } from '@/hooks/useMarketData';
 import { useRegistryData } from '@/hooks/useRegistryData';
 import { useToast } from '@/contexts/ToastContext';
 import { apiPost } from '@/utils/fetchInterceptor';
 import { slugifyServerName } from '@/utils/serverName';
 import MarketServerCard from '@/components/MarketServerCard';
+import MarketplaceBrowseCard from '@/components/MarketplaceBrowseCard';
+import MarketplaceBrowseDetail from '@/components/MarketplaceBrowseDetail';
+import { getMarketplaceKind, type MarketplaceKind } from '../../../src/utils/marketplace.js';
 import MarketServerDetail from '@/components/MarketServerDetail';
 import RegistryServerCard from '@/components/RegistryServerCard';
 import RegistryServerDetail from '@/components/RegistryServerDetail';
@@ -27,20 +34,24 @@ const MarketPage: React.FC = () => {
   const { showToast } = useToast();
 
   const [searchParams, setSearchParams] = useSearchParams();
-  // The cloud (MCPRouter) tab is hidden; only 'local' and 'registry' remain.
+  const sectionParam = searchParams.get('section');
+  const currentSection: MarketplaceKind =
+    sectionParam === 'skill' || sectionParam === 'directory' ? sectionParam : 'mcp';
   const currentTab: 'local' | 'registry' =
-    searchParams.get('tab') === 'registry' ? 'registry' : 'local';
+    currentSection === 'mcp' && searchParams.get('tab') === 'registry' ? 'registry' : 'local';
 
   const {
     servers: localServers,
     allServers: allLocalServers,
+    sectionEntries,
+    sectionCounts,
+    clearFilters: clearLocalFilters,
     categories: localCategories,
     loading: localLoading,
     error: localError,
     setError: setLocalError,
     searchServers: searchLocalServers,
     filterByCategory: filterLocalByCategory,
-    filterByTag: filterLocalByTag,
     selectedCategory: selectedLocalCategory,
     selectedTag: selectedLocalTag,
     installServer: installLocalServer,
@@ -51,7 +62,7 @@ const MarketPage: React.FC = () => {
     changePage: changeLocalPage,
     serversPerPage: localServersPerPage,
     changeServersPerPage: changeLocalServersPerPage,
-  } = useMarketData();
+  } = useMarketData(currentSection);
 
   const {
     servers: registryServers,
@@ -84,16 +95,28 @@ const MarketPage: React.FC = () => {
   const [installedRegistryServers, setInstalledRegistryServers] = useState<Set<string>>(new Set());
 
   useEffect(() => {
+    let active = true;
     const loadServerDetails = async () => {
       if (serverName) {
+        setSelectedServer(null);
+        setSelectedRegistryServer(null);
         if (currentTab === 'registry') {
           const serverEntry = await fetchRegistryServerByName(serverName);
+          if (!active) return;
           if (serverEntry) setSelectedRegistryServer(serverEntry);
           else navigate('/market?tab=registry');
         } else {
           const server = await fetchLocalServerByName(serverName);
-          if (server) setSelectedServer(server);
-          else navigate('/market?tab=local');
+          if (!active) return;
+          if (server) {
+            const kind = getMarketplaceKind(server);
+            if (kind !== currentSection) {
+              navigate(`/market/${encodeURIComponent(server.name)}?section=${kind}&tab=local`, {
+                replace: true,
+              });
+            }
+            setSelectedServer(server);
+          } else navigate('/market?tab=local');
         }
       } else {
         setSelectedServer(null);
@@ -101,9 +124,13 @@ const MarketPage: React.FC = () => {
       }
     };
     loadServerDetails();
+    return () => {
+      active = false;
+    };
   }, [
     serverName,
     currentTab,
+    currentSection,
     fetchLocalServerByName,
     fetchRegistryServerByName,
     navigate,
@@ -112,8 +139,15 @@ const MarketPage: React.FC = () => {
   const switchTab = (tab: 'local' | 'registry') => {
     const newParams = new URLSearchParams(searchParams);
     newParams.set('tab', tab);
+    newParams.set('section', 'mcp');
     setSearchParams(newParams);
     if (serverName) navigate('/market?' + newParams.toString());
+  };
+
+  const switchSection = (section: MarketplaceKind) => {
+    clearLocalFilters();
+    setSearchQuery('');
+    navigate(`/market?section=${section}&tab=local`);
   };
 
   const handleSearch = (e: React.FormEvent) => {
@@ -129,8 +163,7 @@ const MarketPage: React.FC = () => {
   const handleClearFilters = () => {
     if (currentTab === 'local') {
       setSearchQuery('');
-      filterLocalByCategory('');
-      filterLocalByTag('');
+      clearLocalFilters();
     } else if (currentTab === 'registry') {
       setRegistrySearchQuery('');
       clearRegistrySearch();
@@ -144,11 +177,13 @@ const MarketPage: React.FC = () => {
       if (name) navigate(`/market/${encodeURIComponent(name)}?tab=registry`);
     } else {
       const marketServer = server as MarketServer;
-      navigate(`/market/${marketServer.name}?tab=local`);
+      navigate(
+        `/market/${encodeURIComponent(marketServer.name)}?section=${getMarketplaceKind(marketServer)}&tab=local`,
+      );
     }
   };
 
-  const handleBackToList = () => navigate(`/market?tab=${currentTab}`);
+  const handleBackToList = () => navigate(`/market?section=${currentSection}&tab=${currentTab}`);
 
   const handleLocalInstall = async (server: MarketServer, config: ServerConfig) => {
     try {
@@ -177,7 +212,9 @@ const MarketPage: React.FC = () => {
       showToast(t('registry.installSuccess', { name: server.title || server.name }), 'success');
     } catch (error) {
       showToast(
-        t('registry.installError', { error: error instanceof Error ? error.message : String(error) }),
+        t('registry.installError', {
+          error: error instanceof Error ? error.message : String(error),
+        }),
         'error',
       );
     } finally {
@@ -198,6 +235,14 @@ const MarketPage: React.FC = () => {
   };
 
   if (selectedServer) {
+    if (getMarketplaceKind(selectedServer) !== 'mcp')
+      return (
+        <MarketplaceBrowseDetail
+          key={selectedServer.name}
+          entry={selectedServer}
+          onBack={handleBackToList}
+        />
+      );
     return (
       <MarketServerDetail
         server={selectedServer}
@@ -228,6 +273,7 @@ const MarketPage: React.FC = () => {
   const allServers = isLocalTab ? allLocalServers : allRegistryServers;
   const categories = isLocalTab ? localCategories : [];
   const loading = isLocalTab ? localLoading : registryLoading;
+  const showSidebar = isLocalTab && categories.length > 0;
   const error = isLocalTab ? localError : registryError;
   const setError = isLocalTab ? setLocalError : setRegistryError;
   const selectedCategory = isLocalTab ? selectedLocalCategory : '';
@@ -236,12 +282,30 @@ const MarketPage: React.FC = () => {
   const totalPages = isLocalTab ? localTotalPages : registryTotalPages;
   const serversPerPage = isLocalTab ? localServersPerPage : registryServersPerPage;
 
-  const tabs: { id: 'local' | 'registry'; label: string; sourceLabel: string; sourceUrl: string }[] = [
-    { id: 'local', label: t('market.title'), sourceLabel: 'MCPM', sourceUrl: 'https://mcpm.sh' },
+  const sections: { id: MarketplaceKind; key: string; icon: typeof Network }[] = [
+    { id: 'mcp', key: 'servers', icon: Network },
+    { id: 'skill', key: 'skills', icon: BookOpen },
+    { id: 'directory', key: 'directory', icon: Compass },
+  ];
+  const sectionKey =
+    currentSection === 'mcp' ? 'servers' : currentSection === 'skill' ? 'skills' : 'directory';
+
+  const tabs: {
+    id: 'local' | 'registry';
+    label: string;
+    sourceLabel: string;
+    sourceUrl: string;
+  }[] = [
+    {
+      id: 'local',
+      label: t('market.curatedSource'),
+      sourceLabel: 'MCPM',
+      sourceUrl: 'https://mcpm.sh',
+    },
     {
       id: 'registry',
-      label: t('registry.title'),
-      sourceLabel: t('registry.official'),
+      label: t('market.officialRegistrySource'),
+      sourceLabel: t('market.officialRegistrySource'),
       sourceUrl: 'https://registry.modelcontextprotocol.io',
     },
   ];
@@ -252,46 +316,79 @@ const MarketPage: React.FC = () => {
       <div className="flex items-end justify-between gap-4 mb-6">
         <div>
           <h1 className="hub-h1">{t('nav.market')}</h1>
-          <p className="hub-sub">
-            {tabs.map((tab) => tab.label).join(' · ')}
-          </p>
+          <p className="hub-sub">{t('market.sections.intro')}</p>
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="mb-5">
-        <div style={{ borderBottom: '1px solid var(--hub-line)' }}>
-          <nav className="flex -mb-px gap-1.5">
-            {tabs.map((tab) => {
-              const active = currentTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => switchTab(tab.id)}
-                  className="py-2 px-3 transition-colors text-[14px]"
-                  style={{
-                    borderBottom: '2px solid ' + (active ? 'var(--hub-ink)' : 'transparent'),
-                    color: active ? 'var(--hub-ink)' : 'var(--hub-ink-3)',
-                    fontWeight: active ? 500 : 400,
-                  }}
-                >
-                  {tab.label}
-                  <a
-                    href={tab.sourceUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="hub-mono ml-1.5"
-                    style={{ fontSize: 11, color: 'var(--hub-ink-3)' }}
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    ({tab.sourceLabel})
-                  </a>
-                </button>
-              );
-            })}
+      <nav
+        aria-label={t('market.sections.navigation')}
+        className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6"
+      >
+        {sections.map(({ id, key, icon: Icon }) => (
+          <button
+            key={id}
+            onClick={() => switchSection(id)}
+            aria-pressed={currentSection === id}
+            className="hub-card text-left p-4 transition-colors"
+            style={{
+              borderColor: currentSection === id ? 'var(--hub-accent)' : 'var(--hub-line)',
+              background: currentSection === id ? 'var(--hub-accent-soft)' : 'var(--hub-surface)',
+            }}
+          >
+            <span className="flex items-center justify-between gap-3 mb-2">
+              <Icon size={19} aria-hidden="true" />
+              <span className="hub-mono text-sm">{localLoading ? '—' : sectionCounts[id]}</span>
+            </span>
+            <span className="block font-medium">{t(`market.sections.${key}`)}</span>
+            <span
+              className="block text-xs mt-1 leading-relaxed"
+              style={{ color: 'var(--hub-ink-2)' }}
+            >
+              {t(`market.sections.${key}Description`)}
+            </span>
+          </button>
+        ))}
+      </nav>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="hub-sect">{t(`market.sections.${sectionKey}`)}</h2>
+        {currentSection === 'mcp' && (
+          <nav aria-label={t('market.sourcesNavigation')} className="flex flex-wrap gap-2">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => switchTab(tab.id)}
+                aria-pressed={currentTab === tab.id}
+                className={`hub-btn ${currentTab === tab.id ? 'primary' : 'ghost'}`}
+              >
+                {tab.label}
+              </button>
+            ))}
           </nav>
-        </div>
+        )}
       </div>
+      {currentSection === 'mcp' && (
+        <p className="text-xs mb-5" style={{ color: 'var(--hub-ink-3)' }}>
+          {t('market.sourceLabel')}:{' '}
+          <a
+            href={tabs.find((tab) => tab.id === currentTab)?.sourceUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 underline"
+          >
+            {tabs.find((tab) => tab.id === currentTab)?.sourceLabel}
+            <ExternalLink size={11} aria-hidden="true" />
+          </a>
+        </p>
+      )}
+
+      {currentSection !== 'mcp' && (
+        <p className="hub-sub mb-5">
+          {t(
+            currentSection === 'skill' ? 'market.skillDescription' : 'market.directoryDescription',
+          )}
+        </p>
+      )}
 
       {error && (
         <div
@@ -315,19 +412,27 @@ const MarketPage: React.FC = () => {
 
       {/* Search bar */}
       {(isLocalTab || isRegistryTab) && (
-        <form onSubmit={handleSearch} className="hub-card flex items-center gap-2 px-3 mb-5" style={{ padding: 6 }}>
+        <form
+          aria-label={t('market.searchForm')}
+          onSubmit={handleSearch}
+          className="hub-card flex items-center gap-2 px-3 mb-5"
+          style={{ padding: 6 }}
+        >
           <Search size={16} style={{ color: 'var(--hub-ink-3)', margin: '0 6px 0 6px' }} />
           <input
             type="text"
+            aria-label={t(`market.sections.${sectionKey}Search`)}
             value={isRegistryTab ? registrySearchQuery : searchQuery}
             onChange={(e) => {
               if (isRegistryTab) setRegistrySearchQuery(e.target.value);
               else setSearchQuery(e.target.value);
             }}
             placeholder={
-              isRegistryTab ? t('registry.searchPlaceholder') : t('market.searchPlaceholder')
+              isRegistryTab
+                ? t('registry.searchPlaceholder')
+                : t(`market.sections.${sectionKey}Search`)
             }
-            className="flex-1 bg-transparent outline-none"
+            className="min-w-0 flex-1 bg-transparent outline-none"
             style={{ height: 32, fontSize: 14, color: 'var(--hub-ink)' }}
           />
           <button type="submit" className="hub-btn">
@@ -342,10 +447,10 @@ const MarketPage: React.FC = () => {
         </form>
       )}
 
-      <div className={isLocalTab ? 'grid gap-5' : ''} style={isLocalTab ? { gridTemplateColumns: '180px 1fr' } : undefined}>
+      <div className={showSidebar ? 'grid gap-5 lg:grid-cols-[180px_minmax(0,1fr)]' : ''}>
         {/* Categories sidebar (local only) */}
-        {isLocalTab && (
-          <div>
+        {showSidebar && (
+          <aside aria-label={t('market.categories')}>
             <h3 className="hub-sect mb-2">{t('market.categories')}</h3>
             <div className="flex flex-col gap-0.5">
               <button
@@ -361,7 +466,7 @@ const MarketPage: React.FC = () => {
               >
                 <span>{t('common.all')}</span>
                 <span className="hub-mono" style={{ fontSize: 11, color: 'var(--hub-ink-3)' }}>
-                  {allLocalServers.length}
+                  {sectionEntries.length}
                 </span>
               </button>
               {categories.map((cat) => (
@@ -382,7 +487,7 @@ const MarketPage: React.FC = () => {
                 </button>
               ))}
             </div>
-          </div>
+          </aside>
         )}
 
         {/* Grid */}
@@ -393,21 +498,35 @@ const MarketPage: React.FC = () => {
             </div>
           ) : servers.length === 0 ? (
             <div className="hub-card p-10 text-center" style={{ color: 'var(--hub-ink-3)' }}>
-              {isLocalTab ? t('market.noServers') : t('registry.noServers')}
+              {isLocalTab ? t('market.sectionEmpty') : t('registry.noServers')}
             </div>
           ) : (
             <>
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {servers.map((server, index) =>
-                  isLocalTab ? (
+                {servers.map((server) =>
+                  isLocalTab && currentSection !== 'mcp' ? (
+                    <MarketplaceBrowseCard
+                      key={(server as MarketServer).name}
+                      entry={server as MarketServer}
+                      onClick={handleServerClick}
+                    />
+                  ) : isLocalTab ? (
                     <MarketServerCard
-                      key={index}
+                      key={
+                        isLocalTab
+                          ? (server as MarketServer).name
+                          : `${(server as RegistryServerEntry).server.name}-${(server as RegistryServerEntry).server.version}`
+                      }
                       server={server as MarketServer}
                       onClick={handleServerClick}
                     />
                   ) : (
                     <RegistryServerCard
-                      key={index}
+                      key={
+                        isLocalTab
+                          ? (server as MarketServer).name
+                          : `${(server as RegistryServerEntry).server.name}-${(server as RegistryServerEntry).server.version}`
+                      }
                       serverEntry={server as RegistryServerEntry}
                       onClick={handleServerClick}
                     />
@@ -416,12 +535,12 @@ const MarketPage: React.FC = () => {
               </div>
 
               <div
-                className="flex items-center mt-4 text-[12px]"
+                className="flex flex-wrap items-center gap-3 mt-4 text-[12px]"
                 style={{ color: 'var(--hub-ink-3)' }}
               >
-                <div className="flex-[2]">
+                <div className="w-full sm:flex-[2]">
                   {isLocalTab
-                    ? t('market.showing', {
+                    ? t('market.showingEntries', {
                         from: (currentPage - 1) * serversPerPage + 1,
                         to: Math.min(currentPage * serversPerPage, allServers.length),
                         total: allServers.length,
@@ -432,7 +551,7 @@ const MarketPage: React.FC = () => {
                         total: allServers.length + (registryHasNextPage ? '+' : ''),
                       })}
                 </div>
-                <div className="flex-[4] flex justify-center">
+                <div className="w-full sm:flex-[4] flex justify-center overflow-x-auto">
                   {isRegistryTab ? (
                     <CursorPagination
                       currentPage={currentPage}
@@ -449,7 +568,7 @@ const MarketPage: React.FC = () => {
                     />
                   )}
                 </div>
-                <div className="flex-[2] flex items-center justify-end gap-2">
+                <div className="w-full sm:flex-[2] flex items-center justify-end gap-2">
                   <label htmlFor="perPage">
                     {isLocalTab ? t('market.perPage') : t('registry.perPage')}:
                   </label>

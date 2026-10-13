@@ -36,10 +36,21 @@ undocumented website endpoint is deliberately not assumed. Existing skill
 listings retain their `skills.sh` links. Update the curated overlay or supply a
 reviewed export when changing them.
 
-Skills open their documentation instead of entering the MCP server installation
-flow. Registry listings without launch configurations likewise open documentation;
-use the live Registry tab for supported connection configuration. Registry imports
-do not invent package commands, authentication, licenses, or official endorsements.
+## Marketplace sections
+
+The marketplace separates MCP Servers, Agent Skills, and Directory Listings.
+Each section has its own search, filters, pagination, cards, and detail view.
+MCP Servers retain the connection form and the live Official Registry source.
+Agent Skills show documentation and reviewed skill commands. Directory Listings
+show reference links without offering an MCP installation form.
+
+The recovered snapshot contains 391 MCP servers, 90 skills, and 89 directory
+listings. Entries tagged `Curated Registries` remain directory listings because
+their recovered package commands were inferred. A reviewed entry can explicitly
+set `kind: "mcp"` once its connection configuration has been verified. Entries
+without installation metadata also appear in the directory section. Classification
+does not rewrite the recovered catalog. Registry imports do not invent package
+commands, authentication, licenses, or official endorsements.
 
 To update a customization, edit `overrides.json`, rerun validation, and review the
 diff. To adopt a new upstream version of an overridden entry, remove that override.

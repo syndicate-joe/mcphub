@@ -25,6 +25,15 @@ const MarketServerCard: React.FC<MarketServerCardProps> = ({ server, onClick }) 
     <div
       className="hub-card flex flex-col cursor-pointer transition-colors h-full overflow-hidden"
       onClick={() => onClick(server)}
+      role="button"
+      aria-label={t('market.openEntry', { name: server.display_name || server.name })}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick(server);
+        }
+      }}
       onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--hub-ink-2)')}
       onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--hub-line)')}
     >
@@ -73,10 +82,7 @@ const MarketServerCard: React.FC<MarketServerCardProps> = ({ server, onClick }) 
                 </span>
               )}
             </div>
-            <div
-              className="hub-mono truncate"
-              style={{ fontSize: 11, color: 'var(--hub-ink-3)' }}
-            >
+            <div className="hub-mono truncate" style={{ fontSize: 11, color: 'var(--hub-ink-3)' }}>
               @{server.author?.name || t('market.unknown')}
             </div>
           </div>
@@ -121,7 +127,9 @@ const MarketServerCard: React.FC<MarketServerCardProps> = ({ server, onClick }) 
         >
           <span className="inline-flex items-center gap-1">
             <Zap size={11} />
-            {server.tools?.length ?? 0} {t('server.tools').toLowerCase()}
+            {server.tools?.length
+              ? `${server.tools.length} ${t('server.tools').toLowerCase()}`
+              : t('market.connectionDetails')}
           </span>
           {category && <span className="truncate">{category}</span>}
         </div>

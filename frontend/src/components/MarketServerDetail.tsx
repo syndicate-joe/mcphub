@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MarketServer, MarketServerInstallation } from '@/types';
 import ServerForm from './ServerForm';
+import MarketplaceBrowseDetail from './MarketplaceBrowseDetail';
+import { getMarketplaceKind } from '../../../src/utils/marketplace.js';
 import { detectVariables } from '../utils/variableDetection';
 
 import { ServerConfig } from '@/types';
@@ -79,7 +81,7 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
   };
 
   const handleInstall = () => {
-    if (server.kind === 'skill') return;
+    if (getMarketplaceKind(server) !== 'mcp') return;
     if (!isInstalled) {
       toggleModal();
     }
@@ -132,28 +134,8 @@ const MarketServerDetail: React.FC<MarketServerDetailProps> = ({
   const buttonProps = getButtonProps();
   const preferredInstallation = getPreferredInstallation();
 
-  if (server.kind === 'skill' || !Object.keys(server.installations || {}).length) {
-    return (
-      <div className="hub-card p-6">
-        <button onClick={onBack} className="hub-btn mb-4">
-          {t('market.backToList')}
-        </button>
-        <h2 className="text-2xl font-semibold mb-3">{server.display_name}</h2>
-        <p className="mb-4">{server.description}</p>
-        <p className="mb-4">
-          {t(server.kind === 'skill' ? 'market.skillDescription' : 'market.directoryDescription')}
-        </p>
-        <a
-          href={server.homepage || server.repository?.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="hub-btn primary"
-        >
-          {t(server.kind === 'skill' ? 'market.viewSkill' : 'market.viewDocumentation')}
-        </a>
-      </div>
-    );
-  }
+  if (getMarketplaceKind(server) !== 'mcp')
+    return <MarketplaceBrowseDetail entry={server} onBack={onBack} />;
 
   return (
     <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">

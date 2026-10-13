@@ -3,6 +3,7 @@ import path from 'path';
 import { MarketServer } from '../types/index.js';
 import { getConfigFilePath } from '../utils/path.js';
 import { logger } from '../utils/logger.js';
+import { getMarketplaceKind } from '../utils/marketplace.js';
 
 // Get path to the servers.json file
 export const getServersJsonPath = (): string => {
@@ -35,6 +36,7 @@ export const getMarketServers = (): Record<string, MarketServer> => {
     // use key as name field
     Object.entries(serversObj).forEach(([key, server]) => {
       server.name = key;
+      server.kind = getMarketplaceKind(server);
     });
 
     const sortedEntries = Object.entries(serversObj).sort(([, serverA], [, serverB]) => {

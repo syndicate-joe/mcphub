@@ -15,15 +15,27 @@ const PageFallback: React.FC = () => (
 );
 
 const MainLayout: React.FC = () => {
-  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(
+    () => window.matchMedia('(max-width: 767px)').matches,
+  );
+
+  React.useEffect(() => {
+    const media = window.matchMedia('(max-width: 767px)');
+    const update = () => setSidebarCollapsed(media.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
 
   const toggleSidebar = () => {
-    setSidebarCollapsed(!sidebarCollapsed);
+    setSidebarCollapsed((collapsed) => !collapsed);
   };
 
   return (
     <EmbeddingSyncProvider>
-      <div className="flex h-screen" style={{ background: 'var(--hub-bg)', color: 'var(--hub-ink)' }}>
+      <div
+        className="flex h-screen"
+        style={{ background: 'var(--hub-bg)', color: 'var(--hub-ink)' }}
+      >
         <Sidebar collapsed={sidebarCollapsed} />
         <div className="flex flex-1 flex-col min-w-0 min-h-0">
           <Header onToggleSidebar={toggleSidebar} />

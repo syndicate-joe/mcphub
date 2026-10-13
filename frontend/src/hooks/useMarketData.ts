@@ -1,238 +1,104 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MarketServer, ApiResponse, ServerConfig } from '@/types';
 import { apiGet, apiPost } from '../utils/fetchInterceptor';
+import {
+  getMarketplaceKind,
+  filterMarketplaceEntries,
+  countMarketplaceKinds,
+  paginateMarketplaceEntries,
+  type MarketplaceKind,
+} from '../../../src/utils/marketplace.js';
 
-export const useMarketData = () => {
+export const useMarketData = (kind: MarketplaceKind = 'mcp') => {
   const { t } = useTranslation();
-  const [servers, setServers] = useState<MarketServer[]>([]);
-  const [allServers, setAllServers] = useState<MarketServer[]>([]);
-  const [categories, setCategories] = useState<string[]>([]);
-  const [tags, setTags] = useState<string[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState<string>('');
-  const [selectedTag, setSelectedTag] = useState<string>('');
-  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [catalog, setCatalog] = useState<MarketServer[]>([]);
+  const [selectedCategory, setSelectedCategory] = useState('');
+  const [selectedTag, setSelectedTag] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [currentServer, setCurrentServer] = useState<MarketServer | null>(null);
   const [installedServers, setInstalledServers] = useState<string[]>([]);
-
-  // Pagination states
-  const [currentPage, setCurrentPage] = useState(1);
+  const [page, setPage] = useState(1);
   const [serversPerPage, setServersPerPage] = useState(9);
-  const [totalPages, setTotalPages] = useState(1);
 
-  // Fetch all market servers
+  const sectionEntries = useMemo(() => filterMarketplaceEntries(catalog, kind), [catalog, kind]);
+  const allServers = useMemo(
+    () => filterMarketplaceEntries(catalog, kind, searchQuery, selectedCategory, selectedTag),
+    [catalog, kind, searchQuery, selectedCategory, selectedTag],
+  );
+  const categories = useMemo(
+    () => [...new Set(sectionEntries.flatMap((s) => s.categories || []))].filter(category => sectionEntries.some(entry => !entry.categories?.includes(category))).sort(),
+    [sectionEntries],
+  );
+  const tags = useMemo(
+    () => [...new Set(sectionEntries.flatMap((s) => s.tags || []))].sort(),
+    [sectionEntries],
+  );
+  const sectionCounts = useMemo(() => countMarketplaceKinds(catalog), [catalog]);
+  const pagination = useMemo(
+    () => paginateMarketplaceEntries(allServers, page, serversPerPage),
+    [allServers, page, serversPerPage],
+  );
+
+  const clearFilters = useCallback(() => {
+    setSearchQuery('');
+    setSelectedCategory('');
+    setSelectedTag('');
+    setPage(1);
+  }, []);
+  useEffect(clearFilters, [kind, clearFilters]);
+
   const fetchMarketServers = useCallback(async () => {
+    setLoading(true);
     try {
-      setLoading(true);
-      const data: ApiResponse<MarketServer[]> = await apiGet('/market/servers');
-
-      if (data && data.success && Array.isArray(data.data)) {
-        setAllServers(data.data);
-        // Apply pagination to the fetched data
-        applyPagination(data.data, currentPage);
-      } else {
-        console.error('Invalid market servers data format', { data });
-        setError(t('market.fetchError'));
-      }
+      const response: ApiResponse<MarketServer[]> = await apiGet('/market/servers');
+      if (!response.success || !Array.isArray(response.data))
+        throw new Error(t('market.fetchError'));
+      setCatalog(response.data);
+      setError(null);
     } catch (err) {
-      console.error('Error fetching market servers', { err });
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
   }, [t]);
 
-  // Apply pagination to data
-  const applyPagination = useCallback(
-    (data: MarketServer[], page: number, itemsPerPage = serversPerPage) => {
-      const totalItems = data.length;
-      const calculatedTotalPages = Math.ceil(totalItems / itemsPerPage);
-      setTotalPages(calculatedTotalPages);
-
-      // Ensure current page is valid
-      const validPage = Math.max(1, Math.min(page, calculatedTotalPages));
-      if (validPage !== page) {
-        setCurrentPage(validPage);
-      }
-
-      const startIndex = (validPage - 1) * itemsPerPage;
-      const paginatedServers = data.slice(startIndex, startIndex + itemsPerPage);
-      setServers(paginatedServers);
-    },
-    [serversPerPage],
-  );
-
-  // Change page
-  const changePage = useCallback(
-    (page: number) => {
-      setCurrentPage(page);
-      applyPagination(allServers, page, serversPerPage);
-    },
-    [allServers, applyPagination, serversPerPage],
-  );
-
-  // Fetch all categories
-  const fetchCategories = useCallback(async () => {
-    try {
-      const data: ApiResponse<string[]> = await apiGet('/market/categories');
-
-      if (data && data.success && Array.isArray(data.data)) {
-        setCategories(data.data);
-      } else {
-        console.error('Invalid categories data format', { data });
-      }
-    } catch (err) {
-      console.error('Error fetching categories', { err });
-    }
-  }, []);
-
-  // Fetch all tags
-  const fetchTags = useCallback(async () => {
-    try {
-      const data: ApiResponse<string[]> = await apiGet('/market/tags');
-
-      if (data && data.success && Array.isArray(data.data)) {
-        setTags(data.data);
-      } else {
-        console.error('Invalid tags data format', { data });
-      }
-    } catch (err) {
-      console.error('Error fetching tags', { err });
-    }
-  }, []);
-
-  // Fetch server by name
   const fetchServerByName = useCallback(
     async (name: string) => {
       try {
-        setLoading(true);
-        const data: ApiResponse<MarketServer> = await apiGet(`/market/servers/${name}`);
-
-        if (data && data.success && data.data) {
-          setCurrentServer(data.data);
-          return data.data;
-        } else {
-          console.error('Invalid market server data format', { name, data });
-          setError(t('market.serverNotFound'));
-          return null;
-        }
+        const response: ApiResponse<MarketServer> = await apiGet(
+          `/market/servers/${encodeURIComponent(name)}`,
+        );
+        if (!response.success || !response.data) throw new Error(t('market.serverNotFound'));
+        return response.data;
       } catch (err) {
-        console.error('Error fetching market server', { name, err });
         setError(err instanceof Error ? err.message : String(err));
         return null;
-      } finally {
-        setLoading(false);
       }
     },
     [t],
   );
 
-  // Search servers by query
-  const searchServers = useCallback(
-    async (query: string) => {
-      try {
-        setLoading(true);
-        setSearchQuery(query);
-
-        if (!query.trim()) {
-          // Fetch fresh data from server instead of just applying pagination
-          fetchMarketServers();
-          return;
-        }
-
-        const data: ApiResponse<MarketServer[]> = await apiGet(
-          `/market/servers/search?query=${encodeURIComponent(query)}`,
-        );
-
-        if (data && data.success && Array.isArray(data.data)) {
-          setAllServers(data.data);
-          setCurrentPage(1);
-          applyPagination(data.data, 1);
-        } else {
-          console.error('Invalid market search results format', { query, data });
-          setError(t('market.searchError'));
-        }
-      } catch (err) {
-        console.error('Error searching market servers', { query, err });
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setLoading(false);
-      }
-    },
-    [t, allServers, applyPagination, fetchMarketServers],
-  );
-
-  // Filter servers by category
-  const filterByCategory = useCallback(
-    async (category: string) => {
-      try {
-        setLoading(true);
-        setSelectedCategory(category);
-        setSelectedTag(''); // Reset tag filter when filtering by category
-
-        if (!category) {
-          fetchMarketServers();
-          return;
-        }
-
-        const data: ApiResponse<MarketServer[]> = await apiGet(
-          `/market/categories/${encodeURIComponent(category)}`,
-        );
-
-        if (data && data.success && Array.isArray(data.data)) {
-          setAllServers(data.data);
-          setCurrentPage(1);
-          applyPagination(data.data, 1);
-        } else {
-          console.error('Invalid market category filter results format', { category, data });
-          setError(t('market.filterError'));
-        }
-      } catch (err) {
-        console.error('Error filtering market servers by category', { category, err });
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setLoading(false);
-      }
-    },
-    [t, fetchMarketServers, applyPagination],
-  );
-
-  // Filter servers by tag
-  const filterByTag = useCallback(
-    async (tag: string) => {
-      try {
-        setLoading(true);
-        setSelectedTag(tag);
-        setSelectedCategory(''); // Reset category filter when filtering by tag
-
-        if (!tag) {
-          fetchMarketServers();
-          return;
-        }
-
-        const data: ApiResponse<MarketServer[]> = await apiGet(
-          `/market/tags/${encodeURIComponent(tag)}`,
-        );
-
-        if (data && data.success && Array.isArray(data.data)) {
-          setAllServers(data.data);
-          setCurrentPage(1);
-          applyPagination(data.data, 1);
-        } else {
-          console.error('Invalid market tag filter results format', { tag, data });
-          setError(t('market.tagFilterError'));
-        }
-      } catch (err) {
-        console.error('Error filtering market servers by tag', { tag, err });
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setLoading(false);
-      }
-    },
-    [t, fetchMarketServers, applyPagination],
-  );
+  const searchServers = useCallback((query: string) => {
+    setSearchQuery(query);
+    setPage(1);
+  }, []);
+  const filterByCategory = useCallback((category: string) => {
+    setSelectedCategory(category);
+    setSelectedTag('');
+    setPage(1);
+  }, []);
+  const filterByTag = useCallback((tag: string) => {
+    setSelectedTag(tag);
+    setSelectedCategory('');
+    setPage(1);
+  }, []);
+  const changePage = useCallback((value: number) => setPage(value), []);
+  const changeServersPerPage = useCallback((value: number) => {
+    setServersPerPage(value);
+    setPage(1);
+  }, []);
 
   // Fetch installed servers
   const fetchInstalledServers = useCallback(async () => {
@@ -260,8 +126,14 @@ export const useMarketData = () => {
   // Install server to the local environment
   const installServer = useCallback(
     async (server: MarketServer, customConfig: ServerConfig) => {
-      if (server.kind === 'skill') {
-        setError(t('market.skillDescription'));
+      if (getMarketplaceKind(server) !== 'mcp') {
+        setError(
+          t(
+            getMarketplaceKind(server) === 'skill'
+              ? 'market.skillDescription'
+              : 'market.directoryDescription',
+          ),
+        );
         return false;
       }
       try {
@@ -313,27 +185,16 @@ export const useMarketData = () => {
     [t, fetchInstalledServers],
   );
 
-  // Change servers per page
-  const changeServersPerPage = useCallback(
-    (perPage: number) => {
-      setServersPerPage(perPage);
-      setCurrentPage(1);
-      applyPagination(allServers, 1, perPage);
-    },
-    [allServers, applyPagination],
-  );
-
-  // Load initial data
   useEffect(() => {
     fetchMarketServers();
-    fetchCategories();
-    fetchTags();
     fetchInstalledServers();
-  }, [fetchMarketServers, fetchCategories, fetchTags, fetchInstalledServers]);
+  }, [fetchMarketServers, fetchInstalledServers]);
 
   return {
-    servers,
+    servers: pagination.entries,
     allServers,
+    sectionEntries,
+    sectionCounts,
     categories,
     tags,
     selectedCategory,
@@ -342,20 +203,18 @@ export const useMarketData = () => {
     loading,
     error,
     setError,
-    currentServer,
     fetchMarketServers,
     fetchServerByName,
     searchServers,
     filterByCategory,
     filterByTag,
+    clearFilters,
     installServer,
-    // Pagination properties and methods
-    currentPage,
-    totalPages,
+    currentPage: pagination.currentPage,
+    totalPages: pagination.totalPages,
     serversPerPage,
     changePage,
     changeServersPerPage,
-    // Installed servers methods
     isServerInstalled,
   };
 };
